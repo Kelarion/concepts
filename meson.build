@@ -33,7 +33,6 @@ inc_np = include_directories(incdir_numpy)
 numpy_no_deprecated_api = ['-DNPY_NO_DEPRECATED_API=NPY_1_9_API_VERSION']
 np_dep = declare_dependency(include_directories: inc_np, compile_args: numpy_no_deprecated_api)
 
-
 # Find Cython
 cython = find_program('cython', required: true)
 
@@ -47,7 +46,7 @@ cython_gen = generator(cython,
                                  '--directive', 'cdivision=True'])
 
 # Generate the C source
-sparse_c = cython_gen.process('src/sbmf/spsearch.pyx')
+sparse_c = cython_gen.process('src/sbmf/sparse.pyx')
 
 # Build the extension module
 py.extension_module('sparse',
