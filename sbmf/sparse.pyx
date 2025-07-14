@@ -164,7 +164,7 @@ cdef class BiMat:
         if self.size:
             free(self.size)
 
-    cdef inline int add(self, int i, int j) nogil:
+    cdef inline int add(self, int i, int j) noexcept nogil:
         """
         Add element to set
         """
@@ -178,7 +178,7 @@ cdef class BiMat:
 
         return 1
 
-    cdef inline int remove(self, int i, int j) nogil:
+    cdef inline int remove(self, int i, int j) noexcept nogil:
         """
         Remove element from set
         """
@@ -201,7 +201,7 @@ cdef class BiMat:
 
         return 1 
 
-    cdef inline double[:,:] _dot(self, double[:,:] X, double[:,:] Z) nogil:
+    cdef inline void _dot(self, double[:,:] X, double[:,:] Z) nogil:
         """
         Matrix multiplication on the left, Z = SX
         Must provide the output array Z of appropriate shape
@@ -216,7 +216,7 @@ cdef class BiMat:
                     Z[i][j] += X[self.value[i][k]][j]
         return Z
 
-    cdef inline double[:,:] kernel(self, double[:,:] K) nogil:
+    cdef inline void _kernel(self, double[:,:] K) nogil:
         """
         Return the kernel matrix K = SS'    
         """
@@ -244,11 +244,13 @@ cdef class BiMat:
     def dot(self, double[:,:] X):
         cdef int M = X.shape[1]
         cdef np.ndarray[double, ndim=2] out = np.zeros((self.nrow, M))
-        return self._dot(X, out)
+        self._dot(X, out)
+        return out
 
     def ker(self):
         cdef np.ndarray[double, ndim=2] K = np.zeros((self.nrow, self.nrow))
-        return self.kernel(K)
+        self._kernel(K)
+        return K
 
     def to_csr(self):
         """
@@ -426,7 +428,7 @@ cdef class KernelSampler:
                 self.W[i][j] += self.lr*(self.dW[i][j] - self.W[i][j])
                 self.dW[i][j] = 0.0
 
-    cdef inline double R(self, int i, int j) nogil:
+    cdef inline double R(self, int i, int j) noexcept nogil:
         """
         Compute value of R matrix at index (i,j)
         """
@@ -448,7 +450,7 @@ cdef class KernelSampler:
             return 1.0
         return 0.0
 
-    cdef inline double R0(self, int i, int j) nogil:
+    cdef inline double R0(self, int i, int j) noexcept nogil:
         """
         Compute constant value of R matrix at index (i,j)
         """
@@ -472,7 +474,7 @@ cdef class KernelSampler:
                           int i,
                           double scl,
                           double temp,
-                          double beta) nogil:
+                          double beta) noexcept nogil:
 
         cdef bint regularize = (beta > 1e-6)
         cdef int check
@@ -670,7 +672,7 @@ cdef class GaussianSampler:
         if self.r:
             free(self.r)
 
-    cdef inline void learn(self) nogil:
+    cdef inline void learn(self) noexcept nogil:
         """
         Update shared parameters
         """
@@ -683,7 +685,7 @@ cdef class GaussianSampler:
                 self.r[i] += self.R0(i,j)
                 self.dJ[i][j] = 0.0
 
-    cdef inline double R(self, int i, int j) nogil:
+    cdef inline double R(self, int i, int j) noexcept nogil:
         """
         Compute value of R matrix at index (i,j)
         """
@@ -704,7 +706,7 @@ cdef class GaussianSampler:
         if D - cymin(A,B,C) < self.th:
             return 1.0
 
-    cdef inline double R0(self, int i, int j) nogil:
+    cdef inline double R0(self, int i, int j) noexcept nogil:
         """
         Compute constant value of R matrix at index (i,j)
         """
@@ -728,7 +730,7 @@ cdef class GaussianSampler:
                           double[:,:] WtW, 
                           int i,
                           double temp,
-                          double beta) nogil:
+                          double beta) noexcept nogil:
 
         cdef bint regularize = (beta > 1e-6)
         cdef int check
