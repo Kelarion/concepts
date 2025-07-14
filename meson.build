@@ -49,7 +49,7 @@ np_dep = declare_dependency(include_directories: inc_np, compile_args: numpy_no_
 cython_args = ['-X boundscheck=False',
                '-X wraparound=False',
                '-X cdivision=True',
-               '-X language_legvel=3']
+               '-X language_level=3']
 
 # Build the extension module
 py.extension_module('sparse',
