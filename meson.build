@@ -46,10 +46,14 @@ np_dep = declare_dependency(include_directories: inc_np, compile_args: numpy_no_
 # # Generate the C source
 # sparse_c = cython_gen.process('src/sbmf/sparse.pyx')
 
+cython_args = ['-X boundscheck=False',
+               '-X wraparound=False',
+               '-X cdivision=True',
+               '-X language_legvel=3']
+
 # Build the extension module
 py.extension_module('sparse',
                    'sparse.pyx',
                    dependencies: [py_dep, np_dep],
-                   include_directories: [inc_np],
                    install: true,
-                   cython_args: ['-Xboundscheck=False','-Xwraparound=False','-Xcdivision=False'])
+                   cython_args: cython_args)
