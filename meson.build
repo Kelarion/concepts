@@ -1,7 +1,7 @@
 project('sbmf', 'c', 'cython', version: '0.0.9')
 
 # Find Python and required dependencies
-py = import('python').find_installation()
+py = import('python').find_installation(pure: false)
 py_dep = py.dependency()
 
 ## Find numpy (taken from the sklearn and scipy build files)
