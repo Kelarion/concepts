@@ -1,4 +1,4 @@
-project('sbmf', 'cython', version: '0.0.5')
+project('sbmf', 'c', 'cython', version: '0.0.5')
 
 # Find Python and required dependencies
 py = import('python').find_installation()
