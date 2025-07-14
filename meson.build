@@ -1,5 +1,5 @@
 project('sbmf', 'c', 'cython',
-        version: '0.0.2',
+        version: '0.0.3',
         default_options: ['warning_level=2'])
 
 # Find Python and required dependencies
