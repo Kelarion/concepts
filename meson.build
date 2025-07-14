@@ -38,7 +38,7 @@ cython_args = ['-X boundscheck=False',
 
 # Build the extension module
 py.extension_module('sparse',
-                   'sparse.pyx',
+                   'sbmf/sparse.pyx',
                    dependencies: [py_dep, np_dep],
                    install: true,
                    subdir: 'sbmf',
