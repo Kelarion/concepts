@@ -214,7 +214,6 @@ cdef class BiMat:
                 Z[i][j] = 0
                 for k in range(self.size[i]):
                     Z[i][j] += X[self.value[i][k]][j]
-        return Z
 
     cdef inline void _kernel(self, double[:,:] K) nogil:
         """
@@ -233,7 +232,6 @@ cdef class BiMat:
                     for k in range(self.size[j]): 
                         if self.index[i][k] > 0: # k in set i
                             K[i][j] += 1.0 
-        return K
 
     def pyadd(self, int i, int j):
         return self.add(i,j)
