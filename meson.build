@@ -1,4 +1,4 @@
-project('sbmf', 'c', 'cython', version: '0.0.5')
+project('sbmf', 'c', 'cython', version: '0.0.6')
 
 # Find Python and required dependencies
 py = import('python').find_installation()
@@ -56,4 +56,5 @@ py.extension_module('sparse',
                    'sparse.pyx',
                    dependencies: [py_dep, np_dep],
                    install: true,
+                   subdir: 'sbmf',
                    cython_args: cython_args)
