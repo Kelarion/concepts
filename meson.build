@@ -53,4 +53,5 @@ py.extension_module('sparse',
                    sparse_c,
                    dependencies: [py_dep, np_dep],
                    include_directories: [inc_np],
-                   install: true)
+                   install: true,
+                   subdir:"sbmf")

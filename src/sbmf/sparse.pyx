@@ -17,6 +17,9 @@ cdef enum:
 
 np.import_array()
 
+def magic():
+    pass
+
 ######################################################################
 #### Utils, because it's really annoying to import across files ######
 ######################################################################
