@@ -203,26 +203,38 @@ cdef class BiMat:
     cdef inline void _dot(self, double[:,:] X, double[:,:] Z) nogil:
         """
         Matrix multiplication on the left, Z = SX
-        Must provide the output array Z of appropriate shape
+        Must provide the empty output array Z of appropriate shape
         """
         cdef int nout = X.shape[1]
         cdef int i,j,k
 
         for i in prange(self.nrow, nogil=True):
             for j in range(nout):
-                Z[i][j] = 0
                 for k in range(self.size[i]):
                     Z[i][j] += X[self.value[i][k]][j]
 
+    cdef inline void _rdot(self, double[:,:] X, double[:,:] Z) nogil:
+        """
+        Matrix multiplication on the right, Z = XS
+        Must provide the empty output array Z of appropriate shape
+        """
+        cdef int nout = X.shape[0]
+        cdef int i,j,k
+
+        for k in range(self.nrow):
+            for i in range(nout):
+                for j in range(self.size[k]):
+                    Z[i][self.value[k][j]] += X[i][k]
+
     cdef inline void _kernel(self, double[:,:] K) nogil:
         """
-        Return the kernel matrix K = SS'    
+        Return the kernel matrix K = SS' 
+        Must provide the empty output array K
         """
         cdef int i,j,k
 
         for i in prange(self.nrow, nogil=True):
             for j in range(self.nrow):
-                K[i][j] = 0
                 if self.size[i] <= self.size[j]: # only need to check the smallest
                     for k in range(self.size[i]):
                         if self.index[j][self.value[i][k]] >= 0: # k in set j
@@ -242,6 +254,12 @@ cdef class BiMat:
         cdef int M = X.shape[1]
         cdef np.ndarray[double, ndim=2] out = np.zeros((self.nrow, M))
         self._dot(X, out)
+        return out
+
+    def rdot(self, double[:,:] X):
+        cdef int M = X.shape[0]
+        cdef np.ndarray[double, ndim=2] out = np.zeros((M, self.ncol))
+        self._rdot(X, out)
         return out
 
     def ker(self):
