@@ -225,12 +225,12 @@ cdef class BiMat:
                 K[i][j] = 0
                 if self.size[i] <= self.size[j]: # only need to check the smallest
                     for k in range(self.size[i]):
-                        if self.index[j][self.value[i][k]] > 0: # k in set j
-                            K[i][j] += 1.0 
+                        if self.index[j][self.value[i][k]] >= 0: # k in set j
+                            K[i][j] += 1.0
                 else:
                     for k in range(self.size[j]): 
-                        if self.index[i][self.value[j][k]] > 0: # k in set i
-                            K[i][j] += 1.0 
+                        if self.index[i][self.value[j][k]] >= 0: # k in set i
+                            K[i][j] += 1.0
 
     def pyadd(self, int i, int j):
         return self.add(i,j)
