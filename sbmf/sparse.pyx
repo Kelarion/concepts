@@ -107,7 +107,7 @@ cdef class BiMat:
     ## isin = (index[i][j] > 0)
     cdef:
         int **index    # Index of element in value array
-        int **value    # Array of contained elements
+        int **value    # Unordered list of elements per row
         int *size      # Current number of elements per row
         int nrow
         int ncol
@@ -134,7 +134,6 @@ cdef class BiMat:
             if not self.index[i] or not self.value[i]:
                 raise MemoryError("Could not allocate memory")
 
-        # print('malloced cols')
         # Initialize index array to -1 (invalid) and size to 0
         for i in range(self.nrow):
             self.size[i] = 0
@@ -226,11 +225,11 @@ cdef class BiMat:
                 K[i][j] = 0
                 if self.size[i] <= self.size[j]: # only need to check the smallest
                     for k in range(self.size[i]):
-                        if self.index[j][k] > 0: # k in set j
+                        if self.index[j][self.values[i][k]] > 0: # k in set j
                             K[i][j] += 1.0 
                 else:
                     for k in range(self.size[j]): 
-                        if self.index[i][k] > 0: # k in set i
+                        if self.index[i][self.values[j][k]] > 0: # k in set i
                             K[i][j] += 1.0 
 
     def pyadd(self, int i, int j):

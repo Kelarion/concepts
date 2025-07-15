@@ -4,7 +4,7 @@ build-backend = "mesonpy"
 
 [project]
 name = "sbmf"
-version = "0.0.10"
+version = "0.0.11"
 authors = [
   { name="Matteo Alleman", email="mmallemmann@gmail.com" },
 ]
