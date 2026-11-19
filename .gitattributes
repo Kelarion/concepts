@@ -1,3 +1,4 @@
-*/local_setup.py export-ignore
 .git* export-ignore
 *.yaml export-ignore
+# normalise line endings (the original research files mixed CRLF and LF)
+*.py text eol=lf
