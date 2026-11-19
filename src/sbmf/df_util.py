@@ -1,0 +1,2727 @@
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.utils import parametrize
+
+import numpy as np
+import numpy.linalg as nla
+from itertools import combinations
+from dataclasses import dataclass
+from tqdm import tqdm
+
+import scipy.linalg as la
+import scipy.sparse as sprs
+import scipy.special as spc
+from scipy.optimize import linprog as lp
+from scipy.optimize import nnls
+
+import networkx as nx
+from networkx.drawing.nx_pydot import graphviz_layout
+import cvxpy as cvx
+
+# my code
+from . import util
+
+###############################################
+######### Generally useful ####################
+###############################################
+
+
+def in_conv(A, x):
+    """
+    Check whether x is in the convex hull of columns of A
+    """
+
+    A_eq = np.vstack([np.ones(len(A.T)), A])
+    b_eq = np.concatenate([[1], x])
+
+    return lp(c=np.random.randn(len(A.T)), A_eq=A_eq, b_eq=b_eq).success
+
+def split(S, pi, x, x0):
+
+    n, k = S.shape
+    if sprs.issparse(S):
+        i,s = S.nonzero()
+    else:
+        i, s = np.where(S)
+
+    has = np.nonzero(x > 1e-6)[0]
+
+    split = np.nonzero(np.abs(x - x**2) > 1e-6)[0]
+    these = np.isin(s, split)
+    guys = np.unique(s[these], return_inverse=True)[1]
+
+    ## Add new columns (split features)
+    pi_out = np.append(pi, pi[split]*(1-x[split]))
+    pi_out[split] = pi_out[split]*x[split]
+    s_out = np.append(s, guys+k)
+    i_out = np.append(i, i[these])
+
+    ## Add new row (new item)
+    s_out = np.append(s_out, has)
+    i_out = np.append(i_out, n*np.ones(len(has), int))
+
+    ## Add one-hot column if necessary
+    if x0 > 1e-6:
+        pi_out = np.append(pi_out, x0)
+        s_out = np.append(s_out, s_out.max()+1)
+        i_out = np.append(i_out, n)
+
+    S_out = sprs.coo_array((np.ones(len(i_out)), (i_out, s_out)),
+        shape=(n+1, len(pi_out)))
+
+    return S_out, pi_out
+
+def allsplit(S):
+
+    n,d = S.shape
+
+    return np.block([[S, S, np.zeros((n,1))], [np.ones(d), np.zeros(d), 1]])
+
+def splitpred(S, pi, x, x0):
+
+    S_out, pi_out = split(S, pi, x, x0)
+
+    return (S_out@sprs.diags(pi_out)@S_out.T).todense()
+
+def krusty(X, Y):
+    """
+    Procrustes regression, AX ~ Y where A'A = I
+
+    X is shape (...,d,N) and Y is shape (...,f,N)
+    A is shape (...,f,d)
+
+    requires that d <= f
+    """ 
+
+    M = np.einsum('...ij,...kj->...ik', X, Y)
+    U,s,V = nla.svd(M, full_matrices=False)
+    A = U@V
+    scl = np.sum(s)/np.sum(X**2)
+
+    return scl*A
+
+# def softkrusty(X, Y, lam=1e-2, gam=1e-2, iters=100, lr=1e-2, nonneg=False):
+#     """
+#     X is shape (dimx, points)
+#     Y is shape (dimy, points)
+
+#     A 'soft' Procrustes regression:
+    
+#     min |WX - Y|^2 + lam * |W|^2 - gam * (tr W'W)^2 / tr W'WW'W 
+
+#     which encourages W to be as orthogonal. Trained by gradient descent.
+#     """
+
+#     m,n = X.shape
+#     l,n = Y.shape
+
+#     X_ = X - X.mean(1, keepdims=True)
+#     Y_ = Y - Y.mean(1, keepdims=True)
+
+#     W = np.random.randn(l,m)/np.sqrt(m)
+#     ls = []
+#     for it in range(iters):
+
+#         WTW = W.T@W
+
+#         dXhat = (Y_ - W@X_)
+#         eta = gam*np.trace(WTW)/np.sum(WTW**2)
+#         dReg = (gam-lam)*W - eta*W@WTW
+
+#         dW = dXhat@X_.T/n
+
+#         W -= lr*(dW - dReg)
+
+#         ls.append(np.mean(dXhat**2))
+
+#     return W, ls
+
+def softkrusty(X, Y, lam=1e-2, gam=1e-2, iters=100, nonneg=False, **opt_args):
+
+    n,m = X.shape
+    n,l = Y.shape
+
+    k = min(m,l)
+
+    # X_ = torch.FloatTensor(X - X.mean(1, keepdims=True))
+    # Y_ = torch.FloatTensor(Y - Y.mean(1, keepdims=True))
+    X_ = torch.FloatTensor(X)
+    Y_ = torch.FloatTensor(Y)
+    nrm = torch.mean(Y_**2)
+
+    # W = nn.Parameter(torch.rand(l,m))
+    W = nn.Linear(m, l)
+
+    # optimizer = optim.Adam([W], **opt_args)
+    optimizer = optim.Adam(W.parameters(), **opt_args)
+
+    ls = []
+    pr = []
+    for it in range(iters):
+
+        optimizer.zero_grad()
+
+        loss = nn.MSELoss()(W(X_), Y_)
+        # loss = nn.MSELoss()(W@X_, Y_)
+        ls.append(loss.item()/nrm)
+
+        # WtW = W.T@W
+        WtW = W.weight.T@W.weight
+        loss -= gam*((torch.trace(WtW)**2)/torch.sum(WtW**2))/k
+        # loss += lam*torch.mean(W**2)
+        loss += lam*torch.trace(WtW) / k 
+
+        loss.backward()
+        optimizer.step()
+
+        if nonneg:
+            with torch.no_grad():
+                # W[W<0] = 0
+                W.weight[W.weight<0] = 0
+                W.bias[W.bias<0] = 0
+
+    return W.weight.detach().numpy(), W.bias.detach().numpy(), ls
+
+def minpr(W, lr=1e-2, nonneg=False, iters=100, beta=1e-2):
+
+    m = len(W)
+
+    W_ = 1*W
+    ls = []
+    pr = []
+    for it in range(iters):
+
+        err = W_-W
+
+        WTW = W_.T@W_
+        eta = np.trace(WTW)/np.sum(WTW**2)
+
+        W_ -= lr*(beta*err - eta*(W - W_@WTW))
+        if nonneg:
+            W_[W_<0] = 0
+
+        ls.append(np.mean(err**2))
+        pr.append(eta*np.trace(WTW))
+
+    return W_, [ls, pr]
+
+
+def minham(S, Z, sym=False):
+    """
+    Compute the hamming distance between columns of S and Z
+
+    Assumes that S and Z are sign matrices, i.e. +/- 1
+
+    S is (num_item, num_S_features)
+    Z is (num_item, num_Z_features)
+
+    outputs an (num_S_features,)-sized vector of hamming distances
+    """
+
+    if not np.all(np.abs(S**2 - 1) < 1e-6):
+        S = 2*S-1
+    if not np.all(np.abs(Z**2 - 1) < 1e-6):
+        Z = 2*Z-1
+
+    dH = S.T@Z
+    if sym:
+        dH = np.abs(dH)
+
+    return len(S) - dH.max(1)
+
+def permham(S, Z, norm=False):
+    """
+    Compute the permutation-invariant hamming distance between S and Z
+
+    S is (num_item, num_S_features)
+    Z is (num_item, num_Z_features)
+
+    outputs an (num_S_features,)-sized vector of hamming distances
+    """
+
+    if np.all(np.abs(S**2 - S) < 1e-6):
+        S_ = 2*S-1
+    else:
+        S_ = S
+    if np.all(np.abs(Z**2 - Z) < 1e-6):
+        Z_ = 2*Z-1
+    else:
+        Z_ = Z
+
+    dH = len(S) - np.abs(S_.T@Z_)
+    if norm:
+        dH = dH/np.maximum(np.sum(S>0,axis=0), 1)[:,None]  # clamp empty cols (no /0)
+    aye,jay = util.unbalanced_assignment(dH, one_sided=True)
+
+    return (dH[aye,jay])[np.argsort(aye)]
+
+def permyuke_idx(W, V, norm=False, sym=False):
+    """Feature correspondence (aye, jay) matching columns of W to columns of V by
+    cosine similarity -- the W-based analogue of permham_idx.  Use these indices
+    to align two factorizations by their weights (then score S with a plain
+    Hamming on the aligned columns)."""
+    if norm:
+        Wn = W / (nla.norm(W, axis=0, keepdims=True) + 1e-12)
+        Vn = V / (nla.norm(V, axis=0, keepdims=True) + 1e-12)
+    else:
+        Wn = W
+        Vn = V
+    C = Wn.T @ Vn                                  # (num_W, num_V) cosine sims
+    if sym:
+        C = np.abs(C)
+    return util.unbalanced_assignment(-C, one_sided=True)
+
+def permyuke(W, V, norm=False,sym=False):
+    """
+    Permutation-invariant column cosine similarity between two weight matrices.
+
+    W is (dim, num_W), V is (dim, num_V).  Columns are matched one-sided (via
+    unbalanced_assignment on the negative cosine-similarity matrix) and the
+    matched cosines are returned as a (num_W,)-sized vector (1 = perfect).
+    Matches on |cosine| by default (sign-invariant, like permham); set
+    signed=True to keep the sign.
+    """
+    aye, jay = permyuke_idx(W,V,norm,sym)
+
+    return np.sum((W[:,aye] - V[:,jay])**2, axis=0)[np.argsort(aye)]
+
+def permham_idx(S, Z, norm=False):
+    """
+    Compute the permutation-invariant hamming distance between S and Z
+
+    S is (num_item, num_S_features)
+    Z is (num_item, num_Z_features)
+
+    outputs an (num_S_features,)-sized vector of hamming distances
+    """
+
+    if np.all(np.abs(S**2 - S) < 1e-6):
+        S_ = 2*S-1
+    else:
+        S_ = S
+    if np.all(np.abs(Z**2 - Z) < 1e-6):
+        Z_ = 2*Z-1
+    else:
+        Z_ = Z
+
+    dH = len(S) - np.abs(S_.T@Z_)
+    if norm:
+        dH = dH/np.maximum(np.sum(S>0,axis=0), 1)[:,None]  # clamp empty cols (no /0)
+    aye,jay = util.unbalanced_assignment(dH, one_sided=True)
+
+    return aye,jay
+
+
+def porder(S):
+    """
+    Compute partial order of the columns of S under subset relation
+    """
+
+    Sunq, idx = np.unique(S, axis=1, return_inverse=True)
+
+    k = Sunq.shape[1]
+    ovlp = Sunq.T@Sunq
+    issubset = (ovlp/np.diag(ovlp)[None] - np.eye(k) == 1)
+    aye, jay = np.where(issubset)
+
+    ## Get 
+    graph = {i:jay[aye==i] for i in range(k)}
+    depth = util.depth(graph)
+
+    return depth[idx]
+
+def transcov(S):
+    """
+    Compute a kind of transitive reduction of the covariance, StS
+    """
+
+    Sunq, idx = np.unique(S, axis=1, return_inverse=True)
+
+    StS = Sunq.T@Sunq
+    k = len(StS)
+    norm_ovlp = StS/np.diag(StS)[None] - np.eye(k)
+
+    ## Get the order under the transitive reduction
+    aye, jay = np.where(norm_ovlp == 1)
+    graph = {i:jay[aye==i] for i in range(k)}
+    depth = util.depth(graph)
+
+    ## Compute the positive and negative weights
+    R = np.zeros((k,k))
+
+    # aye, jay = np.where(norm_ovlp == 1)
+    keep = np.abs(depth[aye] - depth[jay]) == 1
+    R[aye[keep], jay[keep]] += 1
+
+    return (R + R.T)[idx,:][:,idx]
+
+# def clean_inhib(S):
+    
+
+def treecorr(S, sym=True):
+    vals = [S.T@S, (1-S).T@S, S.T@(1-S)]
+    if sym:
+        vals.append((1-S).T@(1-S))
+    return np.min(vals, axis=0)
+
+class DidntWorkError(Exception):
+    pass
+
+###############################################
+######### Preprocessing #######################
+###############################################
+
+
+def bounds(s, idx):
+    """
+    
+    """
+
+    lb = -np.ones(len(s))*np.inf
+    ub = np.ones(len(s))*np.inf
+
+    lb[idx[s[idx]>0]] = 0
+    ub[idx[s[idx]<0]] = 0
+    
+    return lb, ub
+
+def sign_kernel(c):
+    """
+    random expansion kernel
+    similar to cho and saul, but for the sign function
+    """
+    return 1 - 2*np.arccos(c)/np.pi
+
+def porthant(c):
+    return 1/2 + np.arcsin(c)/np.pi
+
+def acosker(c):
+    "from Cho and Saul (2009)"
+    th = np.arccos(c)
+    return (np.sin(th) + (np.pi - th)*c)/np.pi
+
+def recenter(K):
+    "recenter kernel so that first point is the origin"
+    d = util.dot2dist(K)
+    return d[1:,[0]] + d[[0],1:] - d[1:,1:]
+
+def merge_balls(d, thrs=1e-3):
+
+    n = len(d)
+
+    remaining = set(range(n))
+    clqs = []
+    while len(remaining) > 0:
+
+        # d_rmn = d[list(remaining),:][:,list(remaining)]
+        clq = util.find_clique(d < thrs, first=list(remaining)[0])
+        remaining -= set(clq)
+        # print(remaining)
+
+        clqs.append(np.eye(n)[clq].sum(0))
+
+    return np.array(clqs)
+
+def fit_tri(K):
+    """
+    Get unique cut decomposition of triangle K
+    """
+
+    cut3 = cut_vertices(3)[1:]
+    vecK = util.vec(K)
+    n = len(vecK)
+
+    alpha = (1+np.sum(vecK))/(np.sum(vecK)- n)
+
+    pi = la.inv(cut3)@(alpha + vecK*(1-alpha))
+
+    return pi
+
+def get_triangles(K):
+    """
+    Binary embeddings of all triangles in K
+    """
+
+    N = len(K)
+
+    cut3 = cut_vertices(3)[1:]
+
+    tri = util.vec(np.array([K[idx,:][:,idx] for idx in combinations(range(N),3)]))
+    n = tri.shape[1]
+
+    alpha = (1+(tri.sum(1,keepdims=True)))/(tri.sum(1, keepdims=True) - n)
+
+    pies = la.inv(cut3)@(alpha + tri*(1-alpha)).T
+    items = np.array([idx for idx in combinations(range(N),3)])
+
+    return pies.T, items
+
+
+def enumerate_cuts(K=None, d=None):
+    """
+    Enumerte all solutions to the cut decomposition, scales extremely poorly
+    """
+
+    zero_tol = 1e-6
+
+    if K is None and d is None:
+        raise ValueError('Must supply an argument')
+    elif d is None:
+        d = util.dot2dist(K)
+
+    N = len(d)
+    if N > 10:
+        raise ValueError('This is gonna take too long, boss')
+
+    S_all = cut_vertices(N)[1:] # don't include 1
+    ncut = len(S_all)
+
+    A_eq = np.block([[np.ones(len(S_all)), 0], [S_all.T, util.vec(d)[:,None]]])
+    b_eq = np.ones(len(S_all.T)+1)
+
+    A_ub = np.vstack([A_eq, -A_eq, -np.eye(ncut+1)])
+    b_ub = np.concatenate([b_eq, -b_eq, np.zeros(ncut+1)])
+
+    from pypoman import compute_polytope_vertices   # FIX: never imported (optional dep)
+
+    Eses = []
+    pies = []
+    for vert in compute_polytope_vertices(A_ub, b_ub):
+        x = vert[:-1]
+
+        pi = x[x > zero_tol]
+        S = util.mat(S_all[x > zero_tol])[:,0,:].T
+
+        pies.append(pi)
+        Eses.append(S)
+
+    return Eses, pies
+
+###############################################
+######### Typical geometries ##################
+###############################################
+
+def cube(N):
+    """
+    Hypercube
+    """
+
+    X = (2*util.F2(N) - 1)
+    return X@X.T/N
+
+def cube_feats(N):
+    """
+    Hypercube
+    """
+
+    X = (2*util.F2(N) - 1)
+    return X
+
+def cross(N):
+    """
+    Cross polytope
+    """
+    X = np.vstack([np.eye(N), -np.flipud(np.eye(N))])
+    return X@X.T
+
+def cross_feats(N):
+    """
+    Cross polytope
+    """
+    X = np.vstack([np.eye(N), -np.flipud(np.eye(N))])
+    return X
+
+# def crosscats(N):
+
+
+def simplex(N):
+    """
+    Simplex
+    """
+    return np.eye(N)
+
+def btree_feats(N):
+    """
+    Balanced binary tree of depth N ... has 2^N leaves
+    """
+
+    F = []
+    for n in range(1, N+1):
+        F.append(np.repeat(np.eye(2**n), 2**(N-n), axis=1))
+    return np.vstack(F)
+
+def btree(N):
+    """
+    Balanced binary tree of depth N ... has 2^N leaves
+    """
+
+    F = btree_feats(N)
+    return F.T@F
+
+def circle_feats(N):
+    """
+    N uniformly placed points on a circle
+    """
+    theta = np.linspace(0, 2*(N-1)*np.pi/N, N)
+
+    x = np.cos(theta)
+    y = np.sin(theta)
+
+    return np.stack([x,y])
+
+def circle(N):
+    """
+    N uniformly placed points on a circle
+    """
+    X = circle_feats(N)
+    return X.T@X
+
+def cyclecats(N):
+    """
+    Binary features of a 2N-cycle
+    """
+    return np.array([np.roll(1*(np.arange(2*N) < N), i) for i in range(N)]).T
+
+def gridcats(N, d=2):
+    """
+    Binary features of an NxNx...xN grid
+    """
+
+    gr1 = np.arange(N)
+
+    X = np.meshgrid(*((gr1,)*d))
+
+    return np.vstack([np.stack([1*(x.flatten()<=i) for i in range(N-1)]) for x in X]).T
+    # x = x.flatten()
+    # y = y.flatten()
+    # Sx = np.stack([1*(x<=i) for i in range(N-1)])
+    # Sy = np.stack([1*(y<=i) for i in range(M-1)])
+    # return np.vstack([Sx, Sy]).T
+
+def grid_feats(N, d=2):
+    """
+    N x N grid
+    """
+
+    gr = np.linspace(-1,1,N)
+    X = np.meshgrid(*((gr,)*d))
+
+    return np.stack([x.flatten() for x in X]).T
+
+def grid(N, M=None):
+
+    X = grid_feats(N, M)
+    return X@X.T
+
+
+def randtree_feats(N, bmin=2, bmax=2):
+    """
+    Random tree with N leaves and out degree between [bmin, bmax]
+    """
+
+    nodes = np.arange(N)
+
+    def branch(descendants):
+        n = len(descendants) # size of subtree
+        b = np.random.choice(range(bmin, bmax+1)) # number of branches
+        b = np.min([b, n])
+        p = np.ones(b)/b # size probabilities
+        s = np.random.multinomial(n-b, p) + 1 # size of each branch
+        fid = np.cumsum(s)
+        bid = np.flip(np.cumsum(np.flip(s)))
+
+        branches = []
+        for i in range(b):
+            br = descendants[-bid[i]:fid[i]]
+            branches.append(br)
+            if s[i] > 1:
+                branches += branch(br)
+
+        return branches
+
+    branches = branch(nodes)
+    X = np.stack([np.eye(N)[b].sum(0) for b in branches]).T
+    return X
+
+def randtree(N, **kwargs):
+
+    X = randtree_feats(N, **kwargs)
+    return X@X.T
+
+def sparse_feats(num_feats, num_data, sparsity=0.1):
+    """
+    Generate continuous but sparse features
+    """
+
+    S = np.random.choice([0,1], 
+        p=[1-sparsity, sparsity], 
+        size=(num_feats, num_data))
+
+    C = np.random.rand(num_feats, num_data)
+
+    return S*C
+
+
+@dataclass
+class UndirectedModel:
+    """A binary undirected graphical model: pairwise couplings J and local
+    fields h.  Build one of a few named structures, optionally `blowup` it into
+    several disjoint copies, and combine independent models with `union` (the
+    disjoint union, J -> block-diag(J, J'), h -> [h, h']).
+    """
+
+    K: int
+    struct: str
+    kwargs: dict = None
+    blowup: int = 1         # graph blow-up: each node -> `blowup` copies
+
+    def __post_init__(self):
+        if self.kwargs is None:
+            self.kwargs = {}
+
+        self.J, self.h = self._build(self.K, self.struct, self.kwargs)
+
+        # graph blow-up: replace each node with `blowup` copies that inherit its
+        # connectivity (copy(i,a) ~ copy(j,b) with weight J[i,j] for i != j) but
+        # are unconnected to each other (the within-node n x n blocks are zero).
+        n = self.blowup
+        if n > 1:
+            K0 = len(self.h)
+            J = np.kron(self.J, np.ones((n, n)))
+            for i in range(K0):
+                J[i * n:(i + 1) * n, i * n:(i + 1) * n] = 0
+            self.J = J
+            self.h = np.repeat(self.h, n)
+
+        self.K = len(self.h)        # total size after blow-up
+
+    @staticmethod
+    def _build(K, struct, kwargs):
+        if struct == 'none':
+            return no_couplings(K)
+        elif struct == 'tree':
+            return random_tree_couplings(K, **kwargs)
+        elif struct == 'categorical':
+            return category_couplings(K, **kwargs)
+        elif struct == 'grid':
+            return grid_couplings(K, **kwargs)
+        elif struct == 'cycle':
+            return cycle_couplings(K, **kwargs)
+        raise ValueError(f'unknown struct {struct!r}')
+
+    def sample(self, N, temp=1):
+        """Draw N observations by Gibbs sampling.  Returns (N, K) binary."""
+        return gibbs(self.J, self.h, temp=temp, n_samp=N).T
+
+    def union(self, other):
+        """Disjoint union with another model: independent blocks side by side."""
+        J, h = _disjoint_union(self.J, self.h, other.J, other.h)
+        return UndirectedModel.from_couplings(J, h)
+
+    @classmethod
+    def from_couplings(cls, J, h):
+        """Build a model directly from precomputed (J, h) (e.g. a union result),
+        bypassing the named-structure construction."""
+        m = cls.__new__(cls)
+        m.J, m.h, m.K = J, h, len(h)
+        m.struct, m.kwargs, m.blowup = 'custom', {}, 1
+        return m
+
+
+def _disjoint_union(J1, h1, J2, h2):
+    """[J1, 0; 0, J2] and [h1, h2] -- independent variables with no cross terms."""
+    return la.block_diag(J1, J2), np.concatenate([h1, h2])
+
+def no_couplings(K):
+
+    return np.zeros((K, K)), np.zeros(K)
+
+def grid_couplings(K, d):
+
+    Jays = []
+    hs = []
+    for i in range(d):
+        Jays.append(-np.eye(K,k=1) - np.eye(K,k=-1))
+        hs.append(1 - np.eye(K)[-1])
+
+    return la.block_diag(*Jays), np.concatenate(hs)
+
+def random_tree_couplings(K, rho=1, alpha=1, beta=0):
+    # K = number of tree nodes; rho/alpha shape the tree (forwarded), beta is the
+    # clique-size surplus rate (-> tau).  generate_signed_block_matrix blows each
+    # node up into a clique, so the returned J/h have dimension len(J) >= K.
+    G = util.generate_parametric_no_chain_tree(K, rho=rho, alpha=alpha)
+    J, idx = util.generate_signed_block_matrix(G, tau=beta)
+
+    h = -1 * np.ones(len(J))            # one field per clique node, not per tree node
+    source = next(nx.topological_sort(G))
+    h[idx[source]] = 0                  # root clique gets zero field
+
+    return J, h
+
+def category_couplings(K):
+
+    J = np.eye(K) - np.ones((K,K)) 
+    h = np.zeros(K)
+
+    return J, h
+
+
+def cycle_couplings(K, d=1):
+
+    J = -np.eye(K,k=1) - np.eye(K,k=-1)
+    J[0,-1] = 1 
+    J[-1,0] = 1
+
+    h = 1 - np.eye(K)[-1]
+    h[0] = 0
+
+    return la.block_diag(*([J]*d)), np.concatenate([h]*d)
+
+
+def gibbs(J, h, temp=1, n_samp=1, t0=10, decay_rate=0.8, period=2):
+
+    burn = period*int(np.log(1e-4/t0)/np.log(decay_rate))
+
+    n = len(h)
+    s = np.random.choice([0,1], size=(n, n_samp))
+    for t in range(burn):
+        T = temp + t0*(decay_rate**(t//period))   # anneal a decaying offset down to `temp`
+        for i in range(n):
+            p = spc.expit((J[i]@s + h[i]) / T)
+            s[i] = 1*(np.random.rand(n_samp) < p)
+
+    return s
+
+def randwalk(J, h, L, n_samp=1, t0=100, decay_rate=0.8, period=2, min_temp=1e-1):
+    """
+    Generate a random walk on the high-probability samples of p(s;J,h)
+    """
+
+    burn = period*int(np.log(1e-4/t0)/np.log(decay_rate))
+
+    n = len(h)
+    s = np.random.choice([0,1], size=(n, n_samp))
+    for t in range(burn):
+        temp = min_temp + t0*(decay_rate**(t//period))
+        for i in range(n):
+            p = spc.expit((J[i]@s + h[i]) / temp)
+            s[i] = 1*(np.random.rand(n_samp) < p)
+
+    samps = np.zeros((n*L, n_samp, n))
+    for t in range(L):
+        for i in range(n):
+            p = spc.expit((J[i]@s + h[i]) / min_temp)
+            s[i] = 1*(np.random.rand(n_samp) < p)
+            samps[t*n +i] += s.T
+
+    return samps
+
+#####################################
+##### NMF ###########################
+#####################################
+
+@dataclass
+class NMF:
+
+    r: int 
+    zl2: float = 0          # L2 penalty on Z
+    zl1: float = 0          # L1 penalty on Z
+    wl2: float = 0          # L2 penalty on W
+    wpr: float = 0          # PR penalty on W
+
+    def initialize(self, X):
+
+        self.n, self.d = X.shape
+
+        self.W = np.random.randn(self.d, self.r)
+        N = X@self.W
+        self.Z = N*(N>0)
+    
+    def grad_step(self, X):
+        """
+        Single step of alternating least squares
+        """
+
+        ## Update Z
+        if (self.zl2 > 1e-6) or (self.zl1 > 1e-6):
+            Z = cvx.Variable((self.n, self.r))
+            cost = cvx.sum_squares(Z@self.W.T - X) 
+            l2 = self.zl2*cvx.sum_squares(Z)
+            l1 = self.zl1*cvx.sum(cvx.abs(Z))
+            prob = cvx.Problem(cvx.Minimize(cost + l2 + l1), constraints=[Z>=0])
+            _ = prob.solve()
+            self.Z = Z.value 
+        else:
+            for i in range(self.n):
+                self.Z[i] = nnls(self.W, X[i])[0]
+
+        ## Update W
+        if (self.wl2 <= 1e-6) and (self.wpr <= 1e-6): ## linear regression
+            self.W = X.T@la.pinv(self.Z).T
+
+        elif self.wpr <= 1e-6: ## ridge regression
+            U,s,V = la.svd(self.Z, full_matrices=False)
+            shat = s/(s**2 + self.wl2**2)
+            self.W = X.T@U@np.diag(shat)@V
+
+        else: ## gradient descent
+            WTW = self.W.T@self.W
+            dXhat = (X - self.Z@self.W.T)
+            # dReg = self.alpha*self.W@np.sign(self.W.T@self.W)
+            dReg = self.wpr*self.W@(np.eye(self.r) - WTW*np.trace(WTW)/np.sum(WTW**2))
+
+            dW = dXhat.T@self.Z/self.n
+            db = dXhat.sum(0)/self.n
+
+            # FIX: dW = (X - Z W^T)^T Z / n is the DESCENT direction of the
+            # reconstruction loss, so it must be added (cf. AffineOperator.backward);
+            # `W -= lr*(dW - dReg)` was ascending the reconstruction error.
+            self.W += 1e-2*(dW + dReg)
+
+@dataclass
+class SemiNMF:
+
+    r: int
+
+    def fit(self, X, max_iter=10):
+        """
+        X is shape (feats, items)
+        """
+
+        self.W, self.Z, e = self.initialize(X)
+
+        # ls = [np.mean((X - self.W@self.Z)**2)]
+        if e > 1e-3:
+            for it in range(max_iter):
+                self.refine(X)
+                # ls.append(np.mean((X - self.W@self.Z)**2))
+
+        # return ls
+
+    def initialize(self, X):
+        """
+        Algorithm 3 from Gillis and Kumar
+        """
+
+        U,s,Vt = la.svd(X, full_matrices=False)
+
+        U = U[:,:self.r]
+        V = Vt[:self.r]
+
+        V = np.sign(V.min(1) + V.max(1))[:,None]*V
+
+        e, y = bisection(V)
+        x = (V.T + e)@y
+
+        vmax = (-V/x[None,:]).max(1)
+        alpha = vmax*(vmax>0)
+
+        Vnew = V + np.outer(alpha, x)
+        Unew = X@la.pinv(Vnew)
+
+        return Unew, Vnew, e
+
+    def refine(self, X):
+        """
+        One step of ALS 
+        """
+        self.W = X@la.pinv(self.Z)
+
+        for i in range(self.r):
+            noti = np.setdiff1d(np.arange(self.r), [i])
+            res = (X - self.W[:,noti]@self.Z[noti]).T@self.W[:,i]
+            self.Z[i] = res / np.sum(self.W[:,i]**2) * (res > 0)
+
+
+def bisection(B):
+    """
+    Find a nearby semi-nonegative matrix B^* using binary search
+    """
+    n,m = B.shape
+    
+    ## First check if 
+    prog = lp(c=np.zeros(n), A_ub=-B.T, b_ub=-np.ones(m))
+    if prog.success:
+        return (0, prog.x)
+
+    emax = np.max(-B*(B<0))
+
+    interval = [0, emax]
+    while interval[1] - interval[0] > 1e-3:
+        e = np.mean(interval) 
+        prog = lp(c=np.zeros(n), A_ub=-(B.T + e), b_ub=-np.ones(m))
+        if prog.success:
+            interval[1] = e
+            y = prog.x          # current best 
+        else:
+            interval[0] = e
+
+    return (interval[1], y)
+
+def seminmf(X, r, max_iter=10, **kwargs):
+
+    fac = NMF(r, **kwargs)
+    fac.initialize(X)
+
+    for it in range(max_iter):
+        fac.grad_step(X)
+
+    return fac.Z, fac.W
+
+
+def binarize(Z, axis=-2):
+    """
+    2-means clustering of Z along a given axis
+    """
+    n = Z.shape[axis]
+
+    Zswp = Z.swapaxes(0, axis)
+    Zsrt = -np.sort(-Zswp, axis=0)
+    errs = np.zeros(Zswp[:-1].shape)
+    for i in range(1,n):
+        set1 = Zsrt[:i]
+        set2 = Zsrt[i:]
+        errs[i-1] = np.var(set1, axis=0) + np.var(set2, axis=0)
+    emin = errs.argmin(0, keepdims=True)
+    elb = np.take_along_axis(Zsrt, emin, axis=0)
+    eub = np.take_along_axis(Zsrt, emin+1, axis=0)
+    thr = 0.5*(elb + eub)
+
+    return 1*(Zswp > thr).swapaxes(0, axis)
+
+#############################################
+######### LP and QP helpers #################
+#############################################
+
+def solve_qp(K, S, reg=1, **solver_args):
+    """
+    Find a set of convex weights which bring S closest to K
+    """
+
+
+    zero_tol = 1e-6
+
+    N = len(K)
+    
+    d = util.dot2dist(K)
+
+    # alpha_max = np.max(la.eigvals(np.ones((N,N)), d)).real
+    # d = alpha_max*d
+
+    S_kron = util.vec(util.outers(S))
+
+    c = np.abs(S.sum(0)) # sparsity bias
+
+    # A = np.block([[np.ones(len(S_kron)), 0], [S_kron.T, util.vec(d)[:,None]]])
+
+    A = np.block([[S_kron.T, util.vec(d)[:,None]]])
+
+    P = A.T@A
+    q = (reg*np.block([c, 0]) - 2*A.sum(0))
+    g = np.concatenate([np.ones(len(c)), [0]])
+
+    x = cvx.Variable(len(P))
+    cost = cvx.quad_form(x, P) + q@x
+    prob = cvx.Problem(cvx.Minimize(cost), constraints=[x>=0, g@x==1])
+
+    prob.solve(**solver_args)
+
+    return x.value[:-1]
+
+
+def solve_lp(K, S=None, eps=0.0, beta=1, return_full=False):
+    """
+    Directly solve an LP to find the sparsest cut decomposition of K
+
+    it's exponential in the dimension of K, so can't handle more than ~20
+    """
+
+    zero_tol = 1e-6
+
+    N = len(K)
+    if N > 10:
+        raise ValueError('This is gonna take too long, boss')
+
+    d = util.dot2dist(K)
+
+    if S is None:
+        Skron = cut_vertices(N) # don't include 1
+    else:
+        Skron = util.vec(util.outers(S))
+
+    c = beta*np.min([(Skron>0).sum(1), (Skron<0).sum(1)], axis=0)
+    c =  (1-eps)*c + eps*np.random.randn(len(Skron))
+
+    A = np.block([[np.ones(len(Skron)), 0], [Skron.T, util.vec(d)[:,None]]])
+    b = np.ones(len(Skron.T)+1)
+
+    prog = lp(c=np.block([c, 0]), A_eq=A, b_eq=b)
+
+    x = prog.x[:-1]
+
+    if return_full:
+        return S, x
+    else:
+        pi = x[x > zero_tol]
+        S_out = util.mat(Skron[x > zero_tol])[:,0,:].T
+
+        S_out = S_out[:,np.argsort(-pi)]
+        pi = pi[np.argsort(-pi)]
+
+        return S_out, pi
+
+
+def binary_lp(K, eps=0, S=None):
+
+    N = len(K)
+
+    if S is None:
+        S = util.F2(N).T
+    i,s = np.nonzero(S)
+    c = (S>1e-6).sum(0) + np.random.randn(len(S.T))*eps
+
+    ## Vectorized construction of sparse outer product matrix
+    i_kr, s_kr, v_kr = util.spouters(i, s, incl_diag=True)
+    
+    S_kron = sprs.coo_array((v_kr, (i_kr, s_kr)))
+
+    vecK = util.vec(K)
+    vecK = np.append(vecK, np.diag(K))
+
+    ## Solve LP
+    prog = lp(c=c, A_eq=S_kron, b_eq=vecK)
+
+    if prog.x is None:
+        raise DidntWorkError
+
+    pi = prog.x
+
+    keep = np.isin(s, np.nonzero(pi > 1e-6)[0])
+
+    s = np.unique(s[keep], return_inverse=True)[1]
+    i = i[keep]
+
+    pi = pi[pi > 1e-6]
+    S = sprs.coo_array((np.ones(len(s)), (i, s)))
+
+    return S, pi
+
+
+def binary_qp(K, eps=0, S=None, reg=0.1, **solver_args):
+
+    N = len(K)
+
+    if S is None:
+        S = util.F2(N)[1:].T
+    if S.sum(0).max() < N:
+        S = np.hstack([S, np.ones((N,1))])
+    i,s = np.nonzero(S)
+
+    i_kr, s_kr, v_kr = util.spouters(i, s, incl_diag=True)
+    S_kron = sprs.coo_array((v_kr, (i_kr, s_kr)))
+
+    c = S.sum(0) # sparsity bias
+
+    k = np.append(util.vec(K), np.diag(K))
+    P = S_kron.T@S_kron
+    q = (reg*c - 2*k@S_kron)
+
+    x = cvx.Variable(P.shape[0])
+    cost = cvx.quad_form(x, P, assume_PSD=True) + q@x
+    prob = cvx.Problem(cvx.Minimize(cost), constraints=[x>=0])
+
+    prob.solve(**solver_args)
+
+    pi = x.value
+
+    S = S[:, pi>1e-6]
+    pi = pi[pi>1e-6]
+
+    return S, pi
+
+
+def canon2half(A, b):
+    """
+    Convert LP constraints from canonical to halfspace 
+    
+    i.e. if 
+    P = {x | Ax = b, x >= 0}
+    
+    returns C, d s.t. 
+    
+    P = {x | Cx <= d}
+    """
+    
+    n = A.shape[1]
+    
+    C = np.vstack([A, -A, -np.eye(n)])
+    d = np.concatenate([b, -b, np.zeros(n)])
+
+    return C, d
+
+
+########################################################
+################## Optimization ########################
+########################################################
+
+def quickpi(K, S):
+    """
+    Assumes outer products of the columns of S are linearly independent
+    """
+    S_kron = util.outers(S - S.mean(0,keepdims=True)).reshape((S.shape[1], -1))
+    return nnls(S_kron.T, util.center(K).flatten())
+
+def sweep(X, S, pi=None, **kwargs):
+    """
+    Sweep through the data, refitting one row of S at a time
+    """
+
+    for n in tqdm(range(1,len(X))):
+
+        S, pie = reassign(X, S, n, pi=pi, **kwargs)
+        # pie = ellpee(S@np.diag(pie)@S.T, S)
+
+        r = np.min([S.sum(0), (1-S).sum(0)], axis=0)
+        # dist = util.centered_distance(X@X.T, S@np.diag(pie)@S.T)
+        # print('b=%d, L=%.2f, (d=%.2f, r=%.2f)'%(S.shape[1], dist+1e-2*r@pie, dist, r@pie))
+
+        keep = (pie>1e-3)
+
+        S = S[:,keep]
+        pie = pie[keep]
+
+        if pi is not None:
+            pi = pie
+
+    return S, pie
+
+def reassign(X, S, n, pi=None, **kwargs):
+    """
+    Remove the nth item and refit the categories
+    """
+
+    N = len(X)
+
+    idx = np.arange(N)
+    idx[n] = idx[-1]
+    idx[-1] = n
+
+    S_ = S[idx]
+    X_ = X[idx]
+
+    # Kbad = util.center(util.ker(util.center(K_)))
+
+    if pi is None:
+        S_ = np.unique(S_[:-1], axis=1)
+        keep = S_.sum(0) > 0
+        S_ = S_[:,keep]
+
+        Es, pie = mindistX(X_, allsplit(S_), **kwargs)
+
+    else:
+        S_, grp = np.unique(S_[:-1], axis=1, return_inverse=True)
+        keep = S_.sum(0) > 0
+        pie = util.group_sum(pi, grp)[keep]
+        S_ = S_[:,keep]
+
+        p, p0, sig = assign(K_, sprs.csr_array(S_), pie, **kwargs)
+
+        Es, pie = split(S_, sig*pie, p, p0)
+        Es = Es.todense()
+
+    return Es[idx], pie
+
+def assign(K, S, pi, incl_pi0=True, beta=1e-5, reg='sparse', eps=0, tol=1e-2):
+    """
+    K is shape (N,N) dense array
+    S is shape (N-1, d) sparse array
+    pi is shape (d,)
+    """
+
+    N = len(K)
+
+    Kbar = util.center(K,-1)
+    Kbar = Kbar/np.sqrt(np.sum(Kbar[:-1,:-1]**2))
+    k = Kbar[:-1,-1]
+    k0 = Kbar[-1,-1]
+
+    if not sprs.issparse(S):
+        S = sprs.coo_array(S)
+
+    s_ = S.mean(0)
+    Pi = sprs.diags(pi)
+
+    t = (N-1)/N
+    n = N-1
+    sqt = np.sqrt(2*t)
+    tn = (t**2 - 2*t/n)
+
+    if incl_pi0:
+        A1 = [S@Pi, np.zeros((n,1)), -S@Pi@s_[:,None]]
+        A2 = [(1-s_)@Pi, [1], [0]]
+        ix = -2
+    else:
+        A1 = [S@Pi, -S@Pi@s_[:,None]]
+        A2 = [(1-s_)@Pi, [0]]
+        ix = -1
+
+    A1 = sprs.hstack(A1)
+    A2 = np.concatenate(A2)
+    a = A1.sum(0)
+
+    A = np.vstack([sqt*(A1-a[None,:]/n), -t*(A2-a[None,:]/n)]) 
+    b = np.concatenate([sqt*k, [-t*k0]]) 
+
+    ## Construct problem
+    x = cvx.Variable(len(s_)+1+incl_pi0) # x = [p_hat, pi_0, sigma]
+
+    qq = np.sqrt(np.sum(util.center((S@Pi@S.T).todense())**2))
+    kq = np.sum(((S@Pi@S.T)*Kbar[:-1,:-1]))
+    # kk = np.sqrt(np.sum(Kbar[:-1,:-1]**2))
+    kk = 1
+    
+    # cost = cvx.sum_squares(A@x - b) + qq*(x[-1]**2) - 2*kq*x[-1]  
+    cost = cvx.sum_squares(A@x - b) + (qq*x[-1] - kq/qq)**2
+
+    if reg == 'sparse': # simple sparsity regularization
+        r = np.where(s_ < 0.5, pi, -pi)
+        if incl_pi0:
+            r = np.append(r, [-1, 0])
+        else:
+            r = np.append(r, [0])
+    elif reg == 'node': # graph-based regularization
+        ns = S.sum(0)
+        cn = spc.binom(n+1, 2)
+        r = ns - (ns**3)/cn 
+        if incl_pi0:
+            r = np.append(r, [0, 0])
+        else:
+            r = np.append(r, [0])
+
+    r = ((1-eps)*r + eps*np.random.randn(len(r)))
+    regcost = cvx.Minimize(cost + beta*r@x)
+    prob = cvx.Problem(regcost, constraints=[x>=0, x[:ix]<=x[-1]])
+
+    Cmin = prob.solve(solver='CLARABEL')
+    xstar = x.value
+
+    ## Round within tolerance (dumb rounding)
+    sig = xstar[-1]
+    p = xstar[:ix]/sig 
+
+    # sort by slack
+    slack = np.round(p) - p
+    pidx = np.argsort(np.abs(slack))
+    piidx = np.argsort(pi)
+
+    # compute marginal loss of rounding each element
+    err = A@xstar - b 
+    cerr = np.cumsum(A[:,:ix][:,pidx]*slack, axis=1)
+    marg = (cerr**2).sum(0)
+
+    # round those below tolerance
+    these = pidx[marg/kk < tol]
+    p[these] += slack[these]
+
+    if incl_pi0:
+        return p, xstar[-2], sig
+    else:
+        return p, sig
+
+
+def refine(X, steps=3, pimin=1e-2, S=None, **kwargs):
+
+    S,pi = mindist(X, S=S,**kwargs)
+
+    piout = np.zeros(len(pi))
+    keep = []
+    for t in range(steps):
+        pi = len(X)*pi/np.sum(pi)
+        keep = pi>pimin
+
+        Es,pie = mindist(X, S=S[:,keep], **kwargs)
+        piout[keep] = pie
+        piout[~keep] = 0
+
+    return S, piout
+
+
+def mindistX(X, S=None, beta=1e-5, eps=0, nonzero=True, 
+    tol=1e-4, reg='sparse', branches=1, verbose=False):
+
+    N = len(X)
+
+    if S is None:
+        S = util.F2(N-1)[1:]
+        S = np.hstack([np.zeros((len(S),1)), S]).T
+
+    # if sprs.issparse(S):
+    #     i,j = S.nonzero()
+    # else:
+    #     i,j = np.nonzero(S)
+    # ikr, jkr, vkr = util.spouters(i,j)
+    # Skron = sprs.coo_array((vkr, (ikr, skr)))
+
+    ## Coefficients
+    # U,s,V = la.svd(X-X.mean(0,keepdims=True), full_matrices=False)
+    # l = s**2
+    S_ = S - S.mean(0, keepdims=True)
+    Q = (S_.T@S_)**2
+    # c = l@(U.T@S_)**2
+    c = ((S_.T@X)**2).sum(1)
+    knrm = np.sum(util.center(X@X.T)**2)
+
+    ## Regularization
+    if reg == 'node':
+        if S.min() == 0:
+            S0 = np.mod(S + S[[0]], 2)
+            c2 = spc.binom(S0.sum(0), 2)
+        elif S.min() == -1:
+            S0 = -S*S[[0]]
+            c2 = spc.binom((S0>0).sum(0), 2)
+        r = c2 - (c2**2)/spc.binom(N, 2)
+    elif reg == 'sparse':
+        r = np.min([S.sum(0), (1-S).sum(0)], axis=0)
+        r[r==1] = 0
+    # elif reg == 'ortho':
+    #     D = np.min([])
+
+    pies = []
+    if verbose:
+        pbar = tqdm(range(branches))
+    else:
+        pbar = range(branches)
+    for br in pbar:
+        if br > 1:
+            rbr = (1-eps)*r + eps*np.random.randn(len(r))
+        else:
+            rbr = 1*r
+
+        pi = cvx.Variable(len(S.T))
+
+        cost = (cvx.quad_form(pi, Q, assume_PSD=True)-2*c@pi)/knrm
+
+        prob = cvx.Problem(cvx.Minimize(cost + beta*rbr@pi), constraints=[pi>=0])
+        prob.solve(solver='CLARABEL')
+        pi = pi.value
+
+        ## round down to tolerance
+        idx = np.argsort(-pi, axis=0)
+        pisrt = pi[idx]
+        Qsrt = Q[idx,:][:,idx]
+        csrt = c[idx]
+        # compute marginal benefit of keeping each feature
+        marg = np.diag(Qsrt)*(pisrt**2) + 2*(np.tril(Qsrt,-1)@pisrt - csrt)*pisrt
+        marg = np.cumsum(marg)/knrm + 1
+        # round down
+        toss = np.argmax(marg <= (1+tol)*marg.min())
+        pi[idx[toss+1:]] = 0
+
+        pies.append(pi)
+
+    pi = np.array(pies)
+
+    if nonzero:
+        these = pi.max(0) > 1e-12
+        S = S[:,these]
+        pi = pi[:,these]
+
+    if branches == 1:
+        pi = pi[0]
+
+    return S, pi
+
+def mindist(K, S=None, **kwargs):
+
+    l,V = la.eigh(util.center(K))
+    X = V[:,l>1e-6]@np.diag(np.sqrt(l[l>1e-6]))
+
+    return mindistX(X, S=S, **kwargs)
+
+# def mindist(K, S=None, beta=1e-3, eps=0, nonzero=True, tol=1e-4, reg='sparse'):
+
+#     N = len(K)
+
+#     if S is None:
+#         S = util.F2(N-1)[1:]
+#         S = np.hstack([np.zeros((len(S),1)), S]).T
+
+#     # if sprs.issparse(S):
+#     #     i,j = S.nonzero()
+#     # else:
+#     #     i,j = np.nonzero(S)
+#     # ikr, jkr, vkr = util.spouters(i,j)
+#     # Skron = sprs.coo_array((vkr, (ikr, skr)))
+
+#     ## Coefficients
+#     l,V = la.eigh(util.center(K))
+#     s_ = S.mean(0)
+#     S_ = S - s_[None,:]
+#     Q = (S_.T@S_)**2
+#     c = l@(V.T@S_)**2
+
+#     ## Regularization
+#     if reg == 'node':
+#         if S.min() == 0:
+#             S0 = np.mod(S + S[[0]], 2)
+#             c2 = spc.binom(S0.sum(0), 2)
+#         elif S.min() == -1:
+#             S0 = -S*S[[0]]
+#             c2 = spc.binom((S0>0).sum(0), 2)
+#         r = c2 - (c2**2)/spc.binom(N, 2)
+#     elif reg == 'sparse':
+#         r = np.min([S.sum(0), (1-S).sum(0)], axis=0)
+#         r[r==1] = 0
+
+#     r = (1-eps)*r + eps*np.random.randn(len(r))
+
+#     pi = cvx.Variable(len(S.T))
+
+#     cost = (cvx.quad_form(pi, Q, assume_PSD=True)-2*c@pi)/(l@l)
+
+#     prob = cvx.Problem(cvx.Minimize(cost + beta*r@pi), constraints=[pi>=0])
+#     prob.solve(solver='CLARABEL')
+#     pi = pi.value
+
+#     ## round down to tolerance
+#     idx = np.argsort(-pi)
+#     pisrt = pi[idx]
+#     Qsrt = Q[idx,:][:,idx]
+#     csrt = c[idx]
+#     # compute marginal benefit of keeping each feature
+#     marg = np.diag(Qsrt)*(pisrt**2) + 2*(np.tril(Qsrt,-1)@pisrt - csrt)*pisrt
+#     marg = np.cumsum(marg)/(l@l) + 1
+#     # round down
+#     toss = np.argmax(marg <= (1+tol)*marg.min())
+#     pi[idx[toss+1:]] = 0
+
+#     if nonzero:
+#         these = pi > 1e-12
+#     else:
+#         these = pi >= -1
+#     return S[:,these], pi[these]
+
+def ellpee(K, S=None, eps=0):
+    """
+    Restrict S to the linear independent rank-1 matrices
+    """
+
+    if S is None:
+        S = util.F2(len(K), True)[1:].T
+
+    S_ = S - S.mean(0, keepdims=True)
+    S_kron = util.outers(S_).reshape((S.shape[1], -1))
+
+    r = np.min([S.sum(0), (1-S).sum(0)], axis=0)
+    r[r==1] = 0
+    r = (1-eps)*r + eps*np.random.randn(len(r))
+
+    pistar = lp(r, A_eq=S_kron.T, b_eq=util.center(K).flatten())
+
+    return pistar.x
+
+
+def suggestions(X, m=1000, unq=False):
+
+    p,r = X.shape
+    w = X@np.random.randn(r,m)
+    S = np.sign(w)
+    if unq:
+        S = np.unique(S*S[[0]], axis=1)
+
+    return S
+
+def gradstep(X, K, m=1000):
+
+    N, d = X.shape
+    w = np.random.randn(d, m)
+    S = np.sign(X@w + 1e-3)
+    S = S@np.diag(S[0])
+    w = w@np.diag(S[0])
+
+    K_ = util.center(K)
+    pred = util.center(S@S.T/m)
+
+    num = np.sum(K_*pred)
+    dem = np.sum(pred**2)
+
+    dS = (K_/dem - (num/dem**2)*pred)@(S - S.mean(0, keepdims=True))
+    dX = dS@(w*(spc.expit(w)*(1-spc.expit(w)))).T
+
+    # Sunq, iunq, nunq = np.unique(S, axis=1, return_counts=True, return_inverse=True)
+    # deez = (Sunq.T@S)==9
+
+    # Es, pie = mindist(K, Sunq>0)
+    # pred = util.center(Es@np.diag(pie)@Es.T)
+    # dS = (K_ - pred)@(Es - Es.mean(0, keepdims=True))
+    # mya = np.diag(pie)@(np.abs((2*Es-1).T@Sunq) == N)@np.diag(1/nunq)
+
+    # W = w@(np.diag(1/nunq)@deez).T
+    # WW = W@mya.T
+    # dX = dS@(WW*(spc.expit(WW)*(1-spc.expit(WW)))).T
+
+    return  X + dX
+
+def buffet(N, alpha, size=1, burn_in=10):
+    """
+    Sample from an Indian buffet process
+    """
+
+    new_col = 1*(np.arange(N) == 0)[:,None]
+
+    samps = []
+    while len(samps) < size:
+
+        K_init = np.random.poisson(alpha*np.sum(1/np.arange(1,N+1)))
+        S = np.random.choice([0,1], (N, K_init))
+        for _ in range(burn_in):
+            for i in range(N):
+                p = S[1:].sum(0)/N
+
+                S[0] = 1*(np.random.rand(len(S[0])) < p)
+
+                deez = p > 0
+                S = S[:,deez]
+
+                n_new = np.random.poisson(alpha/N)
+
+                S = np.hstack([S, np.repeat(new_col, n_new, axis=1)])
+
+                S = np.roll(S, -1, axis=0)
+        samps.append(util.lof(S))
+
+    return samps
+
+
+
+########################################################
+################## Cut polytope ########################
+########################################################
+
+
+def cut_vertices(N, centered=False):
+    """
+    Return vertices of cut polytope over N items
+    """
+    
+    s = 2*util.F2(N)[1:-1] - 1
+    # if centered:
+    #     s -= s.mean(1, keepdims=True)
+    v = np.unique(util.vec(util.outers(s.T)), axis=0)
+
+    # v = (s[:,:,None]*s[:,None,:])[:,trind[0], trind[1]]
+    
+    return v
+
+def schur(S):
+    """
+    Generate pairwise products of columns (i.e. final indices) of S
+    """
+    n = S.shape[-1]
+    one = np.ones(S.shape[:-1]+(1,))
+    pairs = np.array([S[...,i]*S[...,j] for i,j in combinations(range(n), 2)]).T
+    return np.concatenate([one, pairs], axis=-1)
+
+def is_schur_independent(S):
+    n = S.shape[-1]
+    one = np.ones(S.shape[:-1]+(1,))
+    pairs = np.array([S[...,i]*S[...,j] for i,j in combinations(range(n), 2)]).T
+    kron = np.concatenate([one, pairs], axis=-1)
+    return nla.matrix_rank(kron) == kron.shape[1]
+
+def psi(B):
+    """
+    The permanental compound matrix from Sorensen et al.
+    """
+
+    n, k = B.shape
+
+    ## Index sets
+    s1, s2 = np.triu_indices(n, k=1)
+    t1, t2 = np.triu_indices(k)
+    u1, u2, u3 
+    U = np.array(combinations(range(k), 3)).T    # the U set
+
+    psiplus =  2 * B[s1,:][:,U[0]] * B[s2,:][:,U[1]] * B[s2,:][:,U[2]]
+    psiplus += 2 * B[s2,:][:,U[0]] * B[s1,:][:,U[1]] * B[s2,:][:,U[2]]
+    psiplus += 2 * B[s2,:][:,U[0]] * B[s2,:][:,U[1]] * B[s1,:][:,U[2]]
+
+    psimin =  B[s1,:][:,t1] * B[s2,:][:,t2] 
+    psimin += B[s2,:][:,t1] * B[s1,:][:,t2]
+
+
+
+def schurcats(N, p, rmax=np.inf):
+
+    i = 2
+    S = np.random.choice([1,-1], size=(N,2), p=[p, 1-p])
+    while nla.matrix_rank(schur(S)) == (1+spc.binom(i,2)):
+        newS = np.random.choice([1,-1], size=(N,1), p=[p, 1-p])
+        S = np.hstack([S, newS])
+        i += 1
+        if i >= rmax:
+            break
+    S = S[:,:-1]
+    S = S[:,np.abs(S.sum(0))<N]
+
+    return (1+S)//2
+
+def noisyembed(S, dim, logsnr, orth=True, nonneg=False, scl=1e-3):
+    """
+    Return weights and noise for a noisy embedding of S
+    """
+
+    N, r = S.shape
+
+    pi_true = r * np.random.dirichlet(np.ones(r)/scl)
+    W = np.random.randn(dim,r)/np.sqrt(dim)
+    if orth:
+        if r > dim:
+            raise ValueError('Cannot have nonnegative orthogonal compression')
+        if nonneg:
+            mask = randmask(r, dim)
+            W = np.abs(W)*mask
+        else:
+            W = la.qr(W, mode='economic')[0]
+    elif nonneg:
+        W[W<0] = 0 
+    W /= la.norm(W, axis=0, keepdims=True)
+
+    W = W@np.diag(np.sqrt(pi_true))
+
+    noise = np.random.randn(dim, N)/np.sqrt(dim)
+    if nonneg:
+        noise[noise<0] = 0 
+    a = np.sqrt(np.sum((S@W.T)**2)/np.sum(noise**2))*10**(-logsnr/20)
+
+    return W, a*noise.T
+
+def randmask(n, m):
+    assert n < m
+    num = 1 + np.random.multinomial(m-n, [1/n]*n)
+    idx = np.random.permutation(np.repeat(np.arange(n), num))
+
+    return np.eye(n)[idx]
+
+
+def snr2scl(S, dim, logsnr):
+    """
+    Scaling of random noise to achieve a desired logSNR in decibels
+    """
+
+    return np.sqrt(np.sum(S**2)/(len(S)*dim))*10**(-logsnr/20)
+
+# def logsnr(S, noise):
+
+
+def extract_rank_one(A, rand=False, eps=0, **solver_args):
+    """
+    Looking for rank-1 binary components of A, symmetric PSD
+    """
+    
+    N = len(A)
+    # psi = oriented_tricycles(N)
+
+    # H = util.center_kernel(np.eye(N))
+    # null = v[:,l <= 1e-6]
+
+    l, v = la.eigh(util.center_kernel(A))
+    nullA = np.sum(l<=1e-6)
+    # kernA = v[:, :nullA]@v[:, :nullA].T
+
+    # find directions which are orthogonal for all scales
+    # gl, gv = la.eig(np.ones((N,N)), 1-util.correlify(A))
+    # kernA = gv[:, np.abs(gl) > 1e-7]@gv[:, np.abs(gl) > 1e-7].T
+
+    if rand:
+        g = np.random.randn(N,1)
+        # g = sts.ortho_group.rvs(N)@v[:,[-1]]
+        # print(g.T@A@g)
+        O = g@g.T
+        # g = np.random.laplace(size=(N,1))
+        # g = np.random.multivariate_normal(np.zeros(N), A)[:,None]
+    else:
+        g = v[:,-1] + eps*np.random.randn(N)
+        O = np.outer(g,g)
+        # print(O)
+   
+    # active = (np.abs(psi@inv_matrix_map(A) - 1) <= 1e-5) 
+   
+    X = cvx.Variable((N,N), symmetric='True')
+    constraints = [X >> 0]
+    constraints += [cvx.diag(X) == 1]
+    # constraints += [cvx.trace(X@H) == 1]
+
+    # constraints += [cvx.trace(null@null.T@X) == 0]
+    # constraints += [X[:,[i]] + X[[i],:] - X <= 1 for i in range(N)]
+    # constraints += [X[:,[i]] + X[[i],:] + X >= -1 for i in range(N)]
+    # constraints += [cvx.trace(kernA@X) == 0]
+    # if active.sum() > 0:
+    #     constraints += [cvx.trace(np.triu(matrix_map(p)-np.eye(N))@X) == 1 for p in psi[active]]
+    #constraints += [cvx.trace(C@X)/2 <= 1 for C in matrix_map(psi)]
+    
+    prob = cvx.Problem(cvx.Maximize(cvx.trace(O@X)), constraints)
+    # return prob
+    prob.solve(**solver_args)
+    
+    return X.value
+
+
+########################################################
+################## Graph theoretic #####################
+########################################################
+
+class CompGraph:
+
+    def __init__(self, S):
+        """
+        S is shape (n_item, n_feat)
+
+        Compositional graph of binary embedding S
+
+        It's a DAG whose undirected distances match those of 
+        the embedding, but includes some notion of feature 
+        hierarchy and reachability
+        """
+
+        # self.S = np.hstack([S, np.zeros((len(S),1))])
+        self.S = S
+
+        self.N, self.k = S.shape
+
+        self.I = np.eye(self.k)
+
+        self.hidden = []
+        self.edges = np.empty((0,2), dtype=int)
+        self.e_lab = np.empty(0, dtype=int)
+
+        self.set_origin(0)
+
+        ## recursively add edges
+        # visited = []
+        # self.add_comp(0, visited) 
+
+        # ## Recenter points
+        self.data = ~np.isin(np.arange(self.N), self.hidden)
+    
+        # ## Remove interfering hidden nodes
+        # ## (would be better to do this while generating graph?)
+
+    def feasible(self, s):
+
+        ante = self.issup.T@s == self.numsup
+        poss = self.isopp@s == 0
+
+        feas = ante&poss
+
+    def find_center(self):
+
+        d = util.dot2dist(self.S@self.S.T)
+        orig = np.argmin(d[self.data].max(0))
+        
+        return orig
+
+    def remove_nodes(self):
+
+        depth = self.S.sum(1)
+        max_depth = np.max(depth[self.data])
+        these = np.where(self.data|(depth < max_depth))[0]
+        idx = np.repeat(np.arange(len(these)), np.diff(these, append=self.N))
+
+        self.S = self.S[these]
+        self.N = len(these)
+        self.data = ~np.isin(np.arange(self.N), self.hidden)
+
+        ed = []
+        el = []
+        for e,l in zip(self.edges, self.e_lab):
+            if np.all(np.isin(e, these)):
+                ed.append((idx[e[0]], idx[e[1]]))
+                el.append(l)
+
+        self.edges = np.array(ed)
+        self.e_lab = np.array(el)
+
+    def set_origin(self, node):
+
+        self.S = np.mod(self.S + self.S[[node]], 2)
+        self.cats = [set(np.nonzero(s)[0]) for s in self.S]
+
+        self.ovlp = self.S.T@self.S
+
+        ## Superset relation
+        self.issup = (self.ovlp == np.diag(self.ovlp)) - self.I
+        self.numsup = self.issup.sum(0)
+
+        ## Mutual exclusivity (and no self-connections)
+        self.isopp = (self.ovlp == 0) + self.I
+
+        ## flip arrows accordingly
+        for i,e in enumerate(self.edges):
+            if len(self.cats[e[0]]) > len(self.cats[e[1]]):
+                self.edges[i] = (e[1], e[0])
+
+    def add_node(self, s):
+        self.ovlp = self.ovlp + s[None,:]*s[:,None]
+
+
+    def add_comp(self, node, visited, target):
+        """
+        Recursion rule for adding components
+        """
+
+        ## check if any existing edges do the job
+        outgoing = (self.edges[:,0] == node)&(self.S[target][self.e_lab]==1)
+
+        ## otherwise look for new feasible edges
+        if np.sum(outgoing) > 0:
+            feas = self.e_lab[outgoing]
+        else:
+            ante = self.issup.T@self.S[node] == self.numsup
+            poss = self.isopp@self.S[node] == 0
+            feas = np.where(ante*poss*self.S[target])[0]
+
+        if len(feas)>0:
+        # for s in np.where(feas)[0]:
+            score = (self.S*(1-self.S[node])).sum(0)
+
+            s = feas[np.argmax(np.random.permutation(score[feas]))]
+
+            new_node = self.cats[node].union(set([s]))
+            if new_node in self.cats:
+                idx = self.cats.index(new_node)
+                if (node, idx) not in self.edges:
+                    self.edges = np.append(self.edges, [[node, idx]], axis=0)
+                    self.e_lab = np.append(self.e_lab, [s])
+
+                if new_node not in visited:
+                    visited.append(new_node)
+                    self.add_comp(idx, visited, target)
+            else:
+                idx = self.N
+
+                self.S = np.vstack([self.S, self.S[node] + self.I[s]])
+                self.cats.append(new_node)
+                self.hidden.append(idx)
+                self.edges = np.append(self.edges, [[node, idx]], axis=0)
+                self.e_lab = np.append(self.e_lab, [s])
+                self.N += 1
+
+                visited.append(new_node)
+                self.add_comp(idx, visited, target)
+
+## for constructing graph 
+
+def dH(S):
+
+    n = len(S)
+    StS = S.T@S
+    St1 = np.diag(StS)
+
+    D1 = StS
+    D2 = St1[None,:] - StS
+    D3 = St1[:,None] - StS
+    D4 = n - St1[None,:] - St1[:,None] + StS
+
+    best1 = 1*(D1<D2)*(D1<D3)*(D1<D4)
+    best2 = 1*(D2<D1)*(D2<D3)*(D2<D4)
+    best3 = 1*(D3<D2)*(D3<D1)*(D3<D4)
+    best4 = 1*(D4<D2)*(D4<D3)*(D4<D1)
+
+    R = (best1 - best2 - best3 + best4)*1.0
+    r = (best2.sum(0) - best4.sum(0))*1.0
+
+    return R, r
+
+def allpaths(S, verbose=False, separate_duplicates=True, ovlp=None, thr=1e-3):
+    """
+    Paths of the graph of S
+    """
+
+    ## Only unique non-zero columns
+    S_, sidx = np.unique(np.mod(S+S[[0]],2),axis=1, return_inverse=True)
+    S_ = S_[:,S_.sum(0)>0]
+
+    ## Identify unique rows
+    Sunq, idx, inv, cnt = np.unique(S_, axis=0, 
+        return_index=True, return_inverse=True, return_counts=True)
+    vni = np.argsort(inv)
+
+    N, k = Sunq.shape
+    Nall = len(S)
+
+    cats = [set(np.nonzero(s)[0]) for s in Sunq]
+    if ovlp is None:
+        ovlp = S_.T@S_/len(S_)
+
+    ## Superset relation
+    issup = (np.diag(ovlp) - ovlp < thr) - np.eye(k)
+    numsup = issup.sum(0)
+
+    ## Mutual exclusivity (and no self-connections)
+    isopp = (ovlp < thr) + np.eye(k)
+
+    ## Recursion to add components
+    def addcomp(node, visited):
+
+        ante = issup.T@H[node] == numsup
+        poss = isopp@H[node] == 0
+
+        feas = ante&poss
+
+        for s in np.where(feas)[0]:
+
+            new_node = cats[node].union(set([s]))
+            if new_node in cats:
+                idx = cats.index(new_node)
+                if (node, idx) not in edges:
+                    edges.append((node, idx))
+
+                if new_node not in visited:
+                    visited.append(new_node)
+                    addcomp(idx, visited)
+            else:
+                idx = len(H)
+
+                H.append(H[node] + np.eye(k)[s])
+                cats.append(new_node)
+                edges.append((node, idx))
+
+                visited.append(new_node)
+                addcomp(idx, visited)
+
+    edges = []
+    H = [s for s in Sunq]
+    visited = []
+    addcomp(0, visited)
+
+    E = np.array(edges)
+    H = np.array(H)
+
+    M = len(H) 
+
+    ## Deal with items having the same hash
+    is_dup = cnt[inv]>1
+    ndup = np.sum(is_dup)
+
+    H = np.block([[H, np.zeros((M,ndup))],
+                  [H[inv][is_dup], np.eye(ndup)]])
+
+    E = np.block([[E], [inv[is_dup,None], M+np.arange(ndup)[:,None]]])
+
+    ## Sort so that the data is at the top in original order
+    is_data = np.concatenate([cnt==1, np.zeros(M-N), np.ones(ndup)]) > 0
+    data_idx = Nall*np.ones(len(H))
+    ixall = np.arange(Nall)
+    data_idx[is_data] = np.append(idx[cnt==1], ixall[is_dup])
+
+    ids = np.argsort(data_idx)
+    sdi = np.argsort(ids)
+    H = H[ids]
+    E = sdi[E]
+
+    return E, H
+
+# def iswgfam(S):
+#     """
+#     Check whether S is the incidence matrix of a well-graded set system
+#     """
+
+#     check = True
+#     for i,si in enumerate(S):
+#         for sj in S[i+1:]:
+#             diff = 
+
+def inc(S):
+    """
+    Given the binary embedding of a partial cube, return the incidence 
+    """
+    
+    dif = S[None] - S[:,None]
+    dif *= (np.abs(dif).sum(-1,keepdims=True)==1)
+    
+    return dif.sum(1)
+
+def adj(S):
+    """
+    Return adjacency matrix of rows of S
+    """
+    dif = S[None] - S[:,None]
+
+    return (np.abs(dif).sum(-1)==1)*1
+
+
+def walk(A, a, s0, steps=10, temp=1e-3, only_unique=False):
+
+    K = len(A)
+
+    s = 1*s0
+    samps = [1*s0]
+    for it in range(steps):
+        for k in np.random.permutation(range(K)):
+            # newsk = (np.sign(A[k]@s + a[k])+1)//2
+            newsk = 1*(np.random.rand() < spc.expit((A[k]@s + a[k])/temp))
+            if (newsk != s[k]) or (not only_unique):
+                s[k] = newsk
+                samps.append(1*s)
+
+    return np.array(samps)
+
+def signwalk(A, a, s, steps=10, temp=1e-3, only_unique=False):
+
+    K = len(A)
+
+    samps = [1*s]
+    for it in range(steps):
+        for k in np.random.permutation(range(K)):
+            newsk = np.sign(A[k]@s + a[k])
+            if (newsk != s[k]) or (not only_unique):
+                s[k] = newsk
+                samps.append(1*s)
+
+    return np.array(samps)
+
+def path(S, i, j):
+
+    N, k = S.shape
+
+    S = np.mod(S+S[[i]],2)
+    these = S[j]
+
+    cats = [set(np.nonzero(s)[0]) for s in S]
+    ovlp = S.T@S
+
+    ## Superset relation
+    issup = (ovlp == np.diag(ovlp)) - np.eye(k)
+    numsup = issup.sum(0)
+
+    ## Mutual exclusivity (and no self-connections)
+    isopp = (ovlp == 0) + np.eye(k)
+
+    ## Recursion to add components
+    def addcomp(node, visited):
+
+        ante = issup.T@H[node] == numsup
+        poss = isopp@H[node] == 0
+
+        feas = np.where(these*ante*poss)[0]
+        if len(feas) > 0:
+            s = np.random.choice(feas)
+
+            new_node = cats[node].union(set([s]))
+            if new_node in cats:
+                idx = cats.index(new_node)
+                if (node, idx) not in edges:
+                    edges.append((node, idx))
+
+                if new_node not in visited:
+                    visited.append(new_node)
+                    addcomp(idx, visited)
+            else:
+                idx = len(H)
+
+                H.append(H[node] + np.eye(k)[s])
+                cats.append(new_node)
+                edges.append((node, idx))
+
+                visited.append(new_node)
+                addcomp(idx, visited)
+
+    edges = []
+    H = [s for s in S]
+    visited = []
+    addcomp(i, visited)
+
+    return np.array(edges).T, np.array(H[N:])
+
+
+class Symmetric(nn.Module):
+    def forward(self, X):
+        return X.triu(1) + X.triu(1).T  # Return a symmetric matrix
+
+    def right_inverse(self, A):
+        return A.triu(1)
+
+class ZeroDiag(nn.Module):
+    def forward(self, X):
+        return X.triu(1) + X.tril(-1)  # Return a symmetric matrix
+
+    def right_inverse(self, A):
+        return A.triu(1) + A.tril(-1)
+
+class MaxEnt(nn.Module):
+
+    def __init__(self, N, method='logrise'):
+        super().__init__()
+
+        self.N = N
+        self.method = method
+
+        self.J = nn.Linear(N,N)
+        self.J.weight.data.copy_(torch.zeros(N, N))
+        self.J.bias.data.copy_(torch.zeros(N))
+        # parametrize.register_parametrization(self.J, "weight", Symmetric())
+        parametrize.register_parametrization(self.J, "weight", ZeroDiag())
+
+    def fit(self, S, max_iter=100, l1_reg=None, **opt_args):
+
+        M = len(S)
+
+        if l1_reg is None:
+            if self.method == 'logrise':
+                l1_reg = 0.8*np.sqrt(np.log(self.N**2 / 1e-3)/M)
+            else:
+                l1_reg = 0.2*np.sqrt(np.log(self.N**2 / 1e-3)/M)
+                
+        optimizer = optim.Adam(self.J.parameters(), **opt_args)
+        
+        Spt = torch.FloatTensor(S)
+        ls = []
+        for _ in range(max_iter):
+            
+            optimizer.zero_grad()
+
+            pred = self.J(Spt)
+            if self.method == 'logrise':
+                loss = torch.sum(torch.logsumexp(-pred*Spt, 1)) / M
+            elif self.method == 'rple':
+                loss = torch.sum(nn.Softplus()(-2*pred*Spt)) / M
+
+            loss += l1_reg*torch.sum(torch.abs(self.J.weight)) / self.N
+            # loss += l1_reg*torch.sum(torch.abs(self.J.bias)) / self.N
+
+            loss.backward()
+
+            ls.append(loss.item())
+            
+            optimizer.step()
+
+        return ls
+
+def bazinga(S,mean,cov,l1_reg=None,method='rple',max_iter=100):
+    """
+    Solve inverse ising problem with gradient descent
+    """
+
+    N, M = S.shape
+
+    cov_ = cov - np.eye(M)
+    mean_ = (1-np.eye(M))*mean[None]
+
+    J = np.zeros(cov.shape)
+    h = np.zeros(mean.shape)
+
+    if l1_reg is None:
+        if method == 'logrise':
+            l1_reg = 0.8*np.sqrt(np.log(N**2 / 1e-3)/M)
+        else:
+            l1_reg = 0.2*np.sqrt(np.log(N**2 / 1e-3)/M)
+
+    ls = []
+    for _ in range(max_iter):
+
+        pred = np.tanh(S@J + h)
+
+        dJ = pred.T@S/M - cov_ + l1_reg*np.sign(J)
+        dh = pred.mean(0) - mean_
+
+
+
+def fit_J(S, strict=True):
+    
+    n, k = S.shape
+    aye, jay = np.triu_indices(k)
+    
+    allS = util.F2(k)
+    allS = allS[minham(allS.T, S.T)>0]
+    
+    if len(allS) == 0:
+        return np.zeros((k,k))
+    
+    ## vec'd matrices
+    allS_ = util.outers(allS.T)[:,aye,jay]
+    S_ = util.outers(S.T)[:,aye,jay]
+    
+    if strict:
+        c = np.ones(S_.shape[1])
+        # c = -allS_.sum(0)
+        bub = -np.ones(len(allS))
+    else:
+        # c = np.ones(S_.shape[1])
+        c = -allS_.sum(0)
+        # c = -(1/(allS_.sum(1)+1e-12))@allS_
+        bub = np.zeros(len(allS))
+    beq = np.zeros(len(S))
+    
+    sol = lp(c, A_ub=-allS_, b_ub=bub, A_eq=S_, b_eq=beq, bounds=(-1,1))
+    
+    if sol.success:
+        J = np.zeros((k,k))
+        J[aye,jay] = sol.x
+        J += J.T
+        
+        return J
+    else:
+        return None
+
+def brute_mle(S, temp=1, strict=False, lamb=1e-2, **solver_args):
+
+    n, k = S.shape
+    aye, jay = np.triu_indices(k)
+    
+    allS = util.F2(k)
+
+    if len(allS) == 0:
+        return np.zeros((k,k))
+    
+    ## vec'd matrices
+    allS_ = util.outers(allS.T)[:,aye,jay]
+    S_ = util.outers(S.T)[:,aye,jay]
+    
+    vecJ = cvx.Variable(S_.shape[1])
+    
+    if strict:
+        part = cvx.log_sum_exp(allS_@vecJ / temp, axis=0)
+        reg = cvx.sum(cvx.abs(vecJ))
+        cost = cvx.Minimize(part + lamb*reg)
+        constraints = [vecJ >= -1, vecJ <= 1, S_@vecJ == 0]
+    else:
+        c = S_.mean(0)
+        dot = vecJ@c / temp
+        part = cvx.log_sum_exp(allS_@vecJ / temp, axis=0)
+        reg = cvx.sum(cvx.abs(vecJ))
+        cost = cvx.Minimize(part - dot + lamb*reg)
+        constraints = [vecJ >= -1, vecJ <= 1]
+
+    prob = cvx.Problem(cost, constraints)
+
+    minval = prob.solve(**solver_args)
+
+    if minval is not None:
+        J = np.zeros((k,k))
+        J[aye,jay] = vecJ.value
+        J += J.T
+        
+        return J
+    else:
+        return None
+
+
+def meanfield(S):
+
+    R = la.pinv((S-S.mean(0)).T@(S-S.mean(0)))
+    # R = (R > 1e-6) - 1*(R < -1e-6) + np.eye(len(S.T))
+    # r = 1*(R@S.mean(0)>0.5)
+    # J_ = R - 2*np.diag(r)
+    r = R@S.mean(0)
+
+    return R - np.diag(np.diag(R)), r
+
+def fixed_points(J):
+    """
+    Returns a set of fixed points if J is a valid matrix, None otherwise
+    """
+    
+    k = len(J)
+    allS = util.F2(k)
+    
+    val = util.qform(J, allS).squeeze()
+    if np.any(val < -1e-6):
+        return None 
+    
+    return allS[val < 1e-6]
+
+def signdraw(G, **args):
+
+    edges,weights = zip(*nx.get_edge_attributes(G,'weight').items())
+    edge_col = [['r','b'][int(this)] for this in (np.sign(np.array(weights))+1)//2]
+
+    pos = graphviz_layout(G)
+    
+    nx.draw(G, pos, edge_color=edge_col, **args)
+
+def plotgraph(S, type='neato', labels=None, **scat_args):
+    import matplotlib.pyplot as plt          # optional dependency (sbmf[plot])
+    from matplotlib import cm
+
+    E,H = allpaths(np.mod(S+S[[0]],2))
+    G = nx.Graph()
+    G.add_edges_from(E)
+
+    G_E = np.array(G.edges)
+    print(G_E.shape)
+    elab = np.argmax(np.abs(H[G_E[:,0]] - H[G_E[:,1]]), axis=1)
+
+    pos = graphviz_layout(G, type)
+
+    idx = np.argsort(list(pos.keys()))
+    xy = np.array(list(pos.values()))[idx]
+
+    deez = np.isin(np.array(list(G.nodes))[idx], np.arange(len(S)))
+
+    cmap = cm.tab10
+    nx.draw(G, pos, node_size=0, edge_color=elab, edge_cmap=cmap, width=2)
+
+    plt.scatter(xy[deez,0], xy[deez,1], **scat_args)
+
+    if labels is not None:
+        bbox={'facecolor':'white', 
+                   'edgecolor': 'k', 
+                   'alpha': 0.8,
+                   'boxstyle': 'round'}
+        for i in np.where(deez)[0]:
+            plt.text(xy[i,0]+2, xy[i,1]+2, labels[i], bbox=bbox)
+
+
+def plotwalk(J, h, L, n_samp=1, type='kamada_kawai', node_weight='empirical',
+             edge_weight='empirical', gamma=1.0, spread=4.0, min_temp=1,
+             seed=0, **scat_args):
+    """
+    Plot the graph traced out by a random walk on p(s; J, h).
+
+    Nodes are the distinct states visited, edges the transitions between
+    consecutive (single-site Gibbs) states. Nodes and edges are not
+    thresholded: instead size/alpha are scaled by weight**gamma, so larger
+    `gamma` more strongly deemphasises low-probability nodes/edges.
+
+    Edge weight is the product of its two node weights and sets the *ideal edge
+    length* as `1 + spread*weight`: every edge is at least unit length, so a
+    chain of low-weight (bridge/leaf) states can never shortcut the distance
+    between the high-weight nodes it connects, while high-weight (core) edges
+    are stretched longer so the core spreads out and claims most of the plot.
+    Larger `spread` => more area for the core; `gamma` sharpens the weights the
+    same way. Both therefore also affect positioning, not just size/alpha.
+
+    node_weight: 'empirical' (visit frequency) or 'model' (softmax of the
+        Boltzmann score 0.5 s'Js + h's over the visited states).
+    edge_weight: 'empirical' (transition count) or 'product' (product of the
+        two endpoints' node weights).
+    type: layout. 'kamada_kawai' and graphviz 'neato'/'fdp'/'sfdp' honour the
+        ideal edge lengths most faithfully; 'spring'/'arf'/'spectral' read the
+        inverse as an attraction; 'dot'/'twopi'/'circo' also dispatch to
+        graphviz but largely ignore lengths.
+    """
+    import matplotlib.pyplot as plt          # optional dependency (sbmf[plot])
+
+    n = len(h)
+
+    ## Single-site Gibbs frames: (n*L, n_samp, n)
+    samps = randwalk(J, h, L, n_samp=n_samp, min_temp=min_temp)
+    T = samps.shape[0]
+
+    ## Nodes: distinct visited states, with visit counts
+    frames = samps.reshape(T*n_samp, n).astype(int)
+    states, inv, cnt = np.unique(frames, axis=0,
+                                 return_inverse=True, return_counts=True)
+    ids = inv.reshape(T, n_samp)          # node id of each frame, per chain
+    N = len(states)
+
+    ## Edges: consecutive transitions within a chain, undirected, no self-loops
+    a, b = ids[:-1].ravel(), ids[1:].ravel()
+    keep = a != b
+    pairs = np.sort(np.stack([a[keep], b[keep]], 1), axis=1)
+    uE, ucnt = np.unique(pairs, axis=0, return_counts=True)
+
+    ## Node weight: empirical visit frequency or normalized model probability
+    if node_weight == 'model':
+        energy = 0.5*np.einsum('ij,jk,ik->i', states, J, states) + states@h
+        nodeval = np.exp(energy - spc.logsumexp(energy))
+    else:
+        nodeval = cnt / cnt.sum()
+
+    G = nx.Graph()
+    G.add_nodes_from(range(N))
+    for (u, v), w in zip(uE, ucnt):
+        G.add_edge(int(u), int(v), count=float(w))
+    G.remove_nodes_from(list(nx.isolates(G)))   # states never transitioned to/from
+    nodes = list(G.nodes)
+    edges = list(G.edges)
+    EU = np.array(edges)                          # (M, 2), aligned with G.edges
+
+    ## Edge weight: empirical transition count or product of endpoint weights
+    if edge_weight == 'product':
+        edgeval = nodeval[EU[:, 0]] * nodeval[EU[:, 1]]
+    else:
+        edgeval = np.array([G[u][v]['count'] for u, v in edges])
+
+    ## Normalise to [0,1] and sharpen by gamma (drives both layout and the
+    ## visual size/alpha, so gamma affects positioning too)
+    ew = (edgeval/edgeval.max())**gamma
+    nv = (nodeval[nodes]/nodeval[nodes].max())**gamma
+
+    ## Layout. Ideal edge length = 1 + spread*weight: unit baseline keeps a
+    ## low-weight bridge from shortcutting distant core nodes, weight stretches
+    ## the core to claim area. Attraction-based engines get the inverse.
+    length = {e: float(1.0 + spread*w) for e, w in zip(edges, ew)}
+    attract = {e: float(1.0/(1.0 + spread*w)) for e, w in zip(edges, ew)}
+    if type in ('spring', 'fruchterman_reingold'):
+        nx.set_edge_attributes(G, attract, 'w')
+        pos = nx.spring_layout(G, weight='w', seed=seed)
+    elif type == 'arf':
+        nx.set_edge_attributes(G, attract, 'w')
+        pos = nx.arf_layout(G, weight='w', seed=seed)
+    elif type == 'spectral':
+        nx.set_edge_attributes(G, attract, 'w')
+        pos = nx.spectral_layout(G, weight='w')
+    elif type == 'kamada_kawai':
+        nx.set_edge_attributes(G, length, 'w')
+        pos = nx.kamada_kawai_layout(G, weight='w')
+    else:                                         # any graphviz prog
+        nx.set_edge_attributes(G, length, 'len')
+        nx.set_edge_attributes(G, attract, 'weight')
+        pos = graphviz_layout(G, type)
+
+    nx.draw_networkx_edges(G, pos, width=0.5 + 4*ew,
+        edge_color=[(0, 0, 0, al) for al in (0.05 + 0.95*ew)])
+    nx.draw_networkx_nodes(G, pos, nodelist=nodes,
+        node_size=10 + 300*nv, alpha=(0.1 + 0.9*nv), **scat_args)
+    plt.axis('off')
+
+    return states, G
+
+
+def isometrichull(S, nodes):
+    """
+    Remove as as many nodes from `G` as we cal while maintaining 
+    shortest path length between all pairs in `nodes`
+
+    IMPORTANT: the nodes of G should be integers from 1,...,N 
+    WITHOUT ANY GAPS ... so if there is a node labelled 5, then
+    there had better be nodes 1-4 ... I don't want to deal with
+    weird node labels 
+
+    Brute force approach
+    """
+
+    E,H = allpaths(S)
+    G = nx.Graph()
+    G.add_edges_from(E)
+
+    N = len(nodes)
+    M = len(G.nodes)-N
+    
+    ishid = ~np.isin(G.nodes, nodes)
+    hid = list(np.array(G.nodes)[ishid])
+
+    num_paths = np.zeros(int(spc.binom(N,2))) 
+    path_incidence = np.zeros((int(spc.binom(N,2)), N+M))
+
+    G_ = G.copy()
+
+    removed = []
+    for _ in range(M):
+
+        ## We want to select nodes to remove somewhat intelligently
+        k = 0
+        for i in range(N):
+            for j in range(i+1,N):
+                paths = list(nx.all_shortest_paths(G_, nodes[i], nodes[j]))
+                idx, cnt = np.unique(paths, return_counts=True)
+                num_paths[k] = len(paths)
+                path_incidence[k, idx] = cnt
+                k += 1
+
+        remainder = (num_paths[:,None] - path_incidence)
+        allowed = remainder.min(0) > 0
+        score = ishid*allowed*(remainder.sum(0))
+        thisone = np.argmax(score)
+
+        if allowed[thisone] > 0:
+            G_.remove_edges_from(G.edges(thisone))
+            removed.append(thisone)
+            ishid[thisone] = False
+            hid.remove(thisone)
+        else:
+            break
+
+    these_nodes = np.concatenate([nodes, hid])
+    these_edges = np.isin(E[:,0], these_nodes)*np.isin(E[:,1], these_nodes)
+
+    return E[these_edges], H[these_nodes]
+
+
+def pinc(G, nodes):
+
+    N = len(nodes)
+    M = len(G.nodes)-N
+
+    num_paths = np.zeros(int(spc.binom(N,2))) 
+    path_incidence = np.zeros((int(spc.binom(N,2)), N+M))
+
+    k = 0
+    for i in range(N):
+        for j in range(i+1,N):
+            paths = list(nx.all_shortest_paths(G, nodes[i], nodes[j]))
+            idx, cnt = np.unique(paths, return_counts=True)
+            num_paths[k] = len(paths)
+            path_incidence[k, idx] = cnt
+            k += 1
+    return path_incidence, num_paths
+
+
+def ancestors(S):
+    "Get all common ancestors of rows of S"
+    
+    aye, jay = np.triu_indices(len(S),1)
+    
+    ancs = np.unique(S[aye]*S[jay], axis=0)
+    das = bindist(ancs, S)
+    isnode = das.min(1)==0
+    ancs = ancs[~isnode]
+    
+    return ancs[ancs.sum(1)>0]
+    
+def hiddens(S):
+    "Get all hidden nodes, if S is (N,r), up to 2^r"
+    
+    nodes = S[S.sum(1)>0]
+    ancs = ancestors(nodes)
+        
+    while len(ancs) > 0:
+        nodes = np.vstack([nodes, ancs])
+        ancs = ancestors(ancs)
+    
+    return nodes
+    
+def bindist(A, B):
+    return A.sum(1,keepdims=True) + B.sum(1,keepdims=True).T - 2*(A@B.T)
+
+
+def catdist(A, B):
+    """
+    A and B are (N, k) binary matrices
+    """
+    return np.min([A.T@B, (1-A).T@B, A.T@(1-B), (1-A).T@(1-B)], axis=0)
+
+
+def catorder(S):
+    """
+    Compute partial order over categories, based on subset relation
+    ties broken by the index of first item
+    """
+    
+    Sp = np.mod(S + (S.mean(0)>0.5), 2)
+
+    is_sup = (Sp.T@Sp)
+
+
+## 
+
+def oriented_tricycles(N, lower=True):
+    """
+    Return all signed 3-cycles of N-vertex complete graph
+    """
+    
+    ntri = int(0.5*N*(N-1))
+    inds = util.LexOrder()    # FIX: `inds` was undefined
+
+    cyc = np.array([[ inds(i,j) for i,j in combinations(c,2)] for c in combinations(range(N),3)])
+    
+    if lower:
+        signs = np.array([[1,1,-1],
+                          [1,-1,1],
+                          [-1,1,1],
+                          [-1,-1,-1]])
+    else:
+        signs = np.array([[1,1,-1],
+                          [1,-1,1],
+                          [-1,1,1]])
+        
+    return (np.eye(ntri)[:,cyc]@signs.T).reshape((ntri,-1)).T
+
+
+def in_hull(points, x):
+    n_points = len(points)
+    n_dim = len(x)
+    c = np.zeros(n_points)
+    A = np.r_[points.T,np.ones((1,n_points))]
+    b = np.r_[x, np.ones(1)]
+    prog = lp(c, A_eq=A, b_eq=b)
+    return prog.success
+
+def find_edges(V):
+    """
+    Brute force search for edges between vertices V
+    """
+    
+    P = len(V)
+    edges = []
+    
+    for i in range(P):
+        for j in range(i+1, P):
+            
+            rest = ~np.isin(np.arange(P), [i,j])
+            mid = 0.5*(V[i] + V[j])
+            
+            if not in_hull(V[rest], mid):
+                edges.append((i,j))
+    
+    return edges
+
+
+########################################################
+######### Things related to item order #################
+########################################################
+
+
+def item_order(d, sign=1):
+
+    ## Most "explainable" item <=> closest item
+
+    first = np.argmin(sign*np.sum(d, axis=0))
+
+    included = [first]
+    remaining = np.setdiff1d(range(len(d)), first).tolist()
+    for _ in range(len(d)-1):
+        new = remaining[np.argmin(sign*np.sum(d[included,:][:,remaining], axis=0))]
+        included.append(new)
+        remaining.remove(new)
+
+    return np.array(included)
+
+def ball_order(d, sign=1):
+
+    first = np.argmin(sign*np.sum(d, axis=0))
+    return np.argsort(sign*d[first])
+
+def squares_first(d):
+    """
+    Beware, this is quartic in dimension of d
+    """
+
+    squares = []
+
+    for idx in combinations(range(len(d)),4):
+        S, pi = enumerate_cuts(d=d[idx,:][:,idx])
+
+        if len(S) == 1:
+            squares.append(np.eye(len(d))[idx,:].sum(0))
+
+    if len(squares) > 0:
+        in_sq = np.max(squares, axis=0)
+
+        items = np.where(squares[0])[0].tolist()
+
+        included = np.array(squares[0])
+        remaining = np.array(squares[1:])
+
+        while np.sum(included) < np.sum(in_sq):
+
+            ovlp = included@remaining.T
+
+            new_sq = np.argmax(ovlp==3)
+            new_item = np.argmax(remaining[new_sq] - included)
+
+            items.append(new_item)
+
+            included = 1*(included + remaining[new_sq] > 1e-6)
+            remaining = remaining[ovlp<4]
+    else:
+        items = []
+
+    leftovers = np.setdiff1d(range(len(d)), items).tolist()
+
+    return items + leftovers
