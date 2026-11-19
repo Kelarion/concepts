@@ -190,7 +190,7 @@ class LatentPrior:
 
     n_chains: int = 1            # >1 runs C independent chains
     sparse_reg: float = 0.0      # alpha in the kernels
-    tree_reg: float = 1e-2       # beta  in the kernels
+    tree_reg: float = 0.0        # beta  in the kernels (0 = off)
     tree_batch: int = 20         # rows per StS refresh in the tree term; 0 = exact
     slab: bool = False           # spike-and-slab?  picks the link + effective Z
     slab_prior: float = 1.0      # tau (the slab's exponential rate); slab only

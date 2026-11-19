@@ -36,8 +36,8 @@ Optional extras: `sbmf[plot]` (matplotlib, for `df_util.plotgraph` / `plotwalk`)
 
 Every dense model's E-step is a Gibbs sweep that keeps each row's active latents
 in a list, so neighbour sums (likelihood field, Boltzmann coupling, tree penalty)
-cost O(active) rather than O(latents) per site. The tree penalty (`tree_reg`)
-reads the co-occurrence counts `StS` once per batch of `tree_batch` rows
+cost O(active) rather than O(latents) per site. The tree penalty (`tree_reg`,
+off by default) reads the co-occurrence counts `StS` once per batch of `tree_batch` rows
 (default 20) instead of after every flip; `tree_batch=0` gives the exact sampler,
 which draws the same samples as 0.1.0 for a given seed.
 
@@ -51,6 +51,11 @@ the exact sampler in simulations and on real data. Much larger batches can make
 the sampler oscillate (stale counts switch many latents on at once), so keep it
 well below the number of rows. Table rebuilds cost O(latents^2) each, so with
 many rows and latents a larger batch is faster.
+
+`tree_reg` defaults to 0 because it was not found to help: in simulations with
+tree- and grid-structured latents, a Boltzmann prior without it recovered the
+latents as well or better, and `tree_reg = 1` made recovery worse. It remains
+the most expensive part of the E-step when switched on.
 
 ## Develop
 

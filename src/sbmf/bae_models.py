@@ -70,7 +70,7 @@ from .bae_weights import (
 _PRIORS = {'none': LatentPrior, 'boltzmann': BoltzmannPrior, 'mrf': MRFPrior}
 
 
-def make_prior(kind='none', n_chains=1, sparse_reg=0.0, tree_reg=1e-2,
+def make_prior(kind='none', n_chains=1, sparse_reg=0.0, tree_reg=0.0,
                slab=False, slab_prior=1.0, tree_batch=20, **prior_args):
     """Build a latent prior from the fields every model exposes.  `kind` is
     'none' (LatentPrior), 'boltzmann' (BoltzmannPrior) or 'mrf' (MRFPrior);
@@ -586,7 +586,7 @@ class LinearGaussianBMF(BMF):
 
         # Scalars are coerced to float so numba sees ONE signature per kernel: the
         # model fields default to a mix of ints and floats (sparse_reg=0,
-        # tree_reg=1e-2, temp=1, ...) and every new int/float combination
+        # temp=1, ...) and every new int/float combination
         # otherwise triggers a fresh multi-second JIT compile.
         sigma2 = self.sigma_x if self._multi else float(self.sigma_x)
         self.operator.search(
@@ -767,7 +767,7 @@ class SemiBMF(LinearGaussianBMF):
 
     nonneg: bool = False
     sparse_reg: float = 0
-    tree_reg: float = 1e-2
+    tree_reg: float = 0.0
     weight_pr_reg: float = 1e-2
     weight_l2_reg: float = 1e-2
     weight_l1_reg: float = 0.0
@@ -812,7 +812,7 @@ class BiPCA(LinearGaussianBMF):
     A/B testing -- see Procrustes.backward and LinearGaussianBMF.MStep."""
 
     sparse_reg: float = 1e-2
-    tree_reg: float = 0
+    tree_reg: float = 0.0
     fit_intercept: bool = True
     fit_scl: bool = True
     scale_lr: float = 0.10       # log-space relaxation of the decoder scale
@@ -864,7 +864,7 @@ class SCPD(LinearGaussianBMF):
 
     nonneg: bool = False
     sparse_reg: float = 0
-    tree_reg: float = 1e-2
+    tree_reg: float = 0.0
     weight_pr_reg: float = 1e-2
     weight_l1_reg: float = 1e-2
     slab: bool = False
@@ -901,7 +901,7 @@ class RRBMF(LinearGaussianBMF):
     rank: int = None
     nonneg: bool = False
     sparse_reg: float = 0
-    tree_reg: float = 1e-2
+    tree_reg: float = 0.0
     weight_pr_reg: float = 1e-2
     weight_l1_reg: float = 0.0
     weight_l2_reg: float = 1e-2
@@ -988,7 +988,7 @@ class KernelBMF(BMF):
 
     dim_hid: int
     sparse_reg: float = 0
-    tree_reg: float = 1e-2
+    tree_reg: float = 0.0
     tree_batch: int = 20          # rows per StS refresh in the tree penalty; 0 = exact
     uniform_scale: bool = True
     l1_reg: float = 0.0             # only used by the non-uniform scale M-step
