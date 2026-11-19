@@ -145,7 +145,7 @@ class LinearOperator:
                                          debug=debug, parallel=self._multi)
 
     def search(self, XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-               Jc, hc, inplace=True, out=None, prior_temp=1.0):
+               Jc, hc, inplace=True, out=None, prior_temp=1.0, tree_batch=0):
         """Run one discrete E-step.  S is the binary spike (tree/StS), Z the
         effective continuous latent (field accumulation; Z == S with no slab);
         Jc/hc are the structured prior's coupling/field (zeros if unstructured),
@@ -153,7 +153,7 @@ class LinearOperator:
         S and Z are updated in place.  `out` (debug builds only) receives the
         per-element log-odds; None on the normal path."""
         return self._kernel(XW, S, Z, WtW, StS, N, temp, alpha, beta,
-                            tau, sigma2, Jc, hc, inplace, out, prior_temp)
+                            tau, sigma2, Jc, hc, inplace, out, prior_temp, tree_batch)
 
     def backward(self, S, X):
         """One in-place M-step update of this operator's parameters (incl. its
@@ -444,9 +444,9 @@ class Procrustes:
                                          debug=debug, parallel=self._multi)
 
     def search(self, XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-               Jc, hc, inplace=True, out=None, prior_temp=1.0):
+               Jc, hc, inplace=True, out=None, prior_temp=1.0, tree_batch=0):
         return self._kernel(XW, S, Z, WtW, StS, N, temp, alpha, beta,
-                            tau, sigma2, Jc, hc, inplace, out, prior_temp)
+                            tau, sigma2, Jc, hc, inplace, out, prior_temp, tree_batch)
 
     def backward(self, ES, X):
         """One decoder update, then the post-update residual (whose mean square is
@@ -1025,7 +1025,7 @@ class ConvOperator(LinearOperator):
         self._prior = prior
 
     def search(self, XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-               Jc, hc, inplace=True, out=None, prior_temp=1.0):
+               Jc, hc, inplace=True, out=None, prior_temp=1.0, tree_batch=0):
         # convbmf takes the conv-specific feature/time-sparsity scalars; Z/StS/N/
         # tau/sigma2/Jc/hc/prior_temp/out unused in this stub.  (ConvBMF.EStep:1281.)
         from . import old_bae_search      # legacy kernels; not shipped by default

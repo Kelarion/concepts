@@ -191,6 +191,7 @@ class LatentPrior:
     n_chains: int = 1            # >1 runs C independent chains
     sparse_reg: float = 0.0      # alpha in the kernels
     tree_reg: float = 1e-2       # beta  in the kernels
+    tree_batch: int = 20         # rows per StS refresh in the tree term; 0 = exact
     slab: bool = False           # spike-and-slab?  picks the link + effective Z
     slab_prior: float = 1.0      # tau (the slab's exponential rate); slab only
     temp: float = 1.0            # prior temperature (see TempSchedule); inert here
@@ -354,6 +355,7 @@ class LatentPrior:
     def to_serial(self, c):
         """Chain c as an ordinary single-chain (n_chains=1) prior with 2-D state."""
         lp = LatentPrior(sparse_reg=self.sparse_reg, tree_reg=self.tree_reg,
+                         tree_batch=self.tree_batch,
                          slab=self.slab, slab_prior=self.slab_prior,
                          temp=self._chain_temp(c))
         self._copy_state(lp, c)
@@ -657,7 +659,8 @@ class BoltzmannPrior(LatentPrior):
 
     def to_serial(self, c):
         lp = BoltzmannPrior(
-            sparse_reg=self.sparse_reg, tree_reg=self.tree_reg, slab=self.slab,
+            sparse_reg=self.sparse_reg, tree_reg=self.tree_reg,
+            tree_batch=self.tree_batch, slab=self.slab,
             slab_prior=self.slab_prior, temp=self._chain_temp(c),
             J_l1_reg=self.J_l1_reg,
             J_loss=self.J_loss, J_lr=self.J_lr, h_l2_reg=self.h_l2_reg,
@@ -782,7 +785,8 @@ class MRFPrior(LatentPrior):
         beta*(J sigma + h) equals the Boltzmann one 2*(J' S + h') at
         J' = beta*J and h' = (beta/2)*(h - J.sum(-1))."""
         lp = BoltzmannPrior(
-            sparse_reg=self.sparse_reg, tree_reg=self.tree_reg, slab=self.slab,
+            sparse_reg=self.sparse_reg, tree_reg=self.tree_reg,
+            tree_batch=self.tree_batch, slab=self.slab,
             slab_prior=self.slab_prior, temp=self._chain_temp(c),
             J_l1_reg=self.J_lam)
         self._copy_state(lp, c)

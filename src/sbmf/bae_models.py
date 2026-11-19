@@ -71,12 +71,12 @@ _PRIORS = {'none': LatentPrior, 'boltzmann': BoltzmannPrior, 'mrf': MRFPrior}
 
 
 def make_prior(kind='none', n_chains=1, sparse_reg=0.0, tree_reg=1e-2,
-               slab=False, slab_prior=1.0, **prior_args):
+               slab=False, slab_prior=1.0, tree_batch=20, **prior_args):
     """Build a latent prior from the fields every model exposes.  `kind` is
     'none' (LatentPrior), 'boltzmann' (BoltzmannPrior) or 'mrf' (MRFPrior);
     `prior_args` are forwarded to the structured classes only."""
     common = dict(n_chains=n_chains, sparse_reg=sparse_reg, tree_reg=tree_reg,
-                  slab=slab, slab_prior=slab_prior)
+                  tree_batch=tree_batch, slab=slab, slab_prior=slab_prior)
     if kind == 'none':
         return LatentPrior(**common)
     return _PRIORS[kind](**common, **prior_args)
@@ -366,6 +366,8 @@ class LinearGaussianBMF(BMF):
     latent_prior: LatentPrior = field(default_factory=LatentPrior)  # the latent side
     m_iters: int = 1                             # M-step updates per grad_step
     debug: bool = False                          # record per-iteration E-step log-odds
+    tree_batch: int = 20                         # rows per StS refresh in the tree
+                                                 # penalty; 0 = exact (see bae_search)
     # How the observation variance moves (rate `scl_lr`, set in init_params):
     #   'scale_free'  sigma *= exp(lr * clip(err/sigma - 1, +-5))   [the reference]
     #   'legacy'      sigma *= exp(lr * (err - sigma))              [the pre-port rule]
@@ -591,7 +593,7 @@ class LinearGaussianBMF(BMF):
             self.operator.drive(X), S, Z, self.operator.gram(), lp.StS, self.n,
             float(self.temp), float(lp.sparse_reg), float(lp.tree_reg),
             float(lp.slab_prior), sigma2,
-            Jc, hc, inplace, out, prior_temp)
+            Jc, hc, inplace, out, prior_temp, int(lp.tree_batch or 0))
         if self.debug and inplace:
             self.outs.append(out)
 
@@ -837,8 +839,8 @@ class BiPCA(LinearGaussianBMF):
                                    fit_scl=self.fit_scl,
                                    scale_lr=self.scale_lr, m_step=self.m_step)
         common = dict(n_chains=self.n_chains, sparse_reg=self.sparse_reg,
-                      tree_reg=self.tree_reg, slab=self.slab,
-                      slab_prior=self.slab_prior)
+                      tree_reg=self.tree_reg, tree_batch=self.tree_batch,
+                      slab=self.slab, slab_prior=self.slab_prior)
         if self.J_prior == 'mrf':
             # MRFPrior's sparsity knob is l0_reg: the same role and default scale as
             # J_l1_reg, but a per-entry cost in nats rather than an L1 strength.
@@ -952,8 +954,8 @@ def _boltzmann_or_plain(model):
     BoltzmannPrior when asked for and J_lr > 0, an unstructured LatentPrior
     otherwise (so the historical J_lr == 0 fallback still works)."""
     common = dict(n_chains=model.n_chains, sparse_reg=model.sparse_reg,
-                  tree_reg=model.tree_reg, slab=model.slab,
-                  slab_prior=model.slab_prior)
+                  tree_reg=model.tree_reg, tree_batch=model.tree_batch,
+                  slab=model.slab, slab_prior=model.slab_prior)
     if model.J_prior == 'none' or model.J_lr == 0:
         return make_prior('none', **common)
     return make_prior('boltzmann', **common, J_l1_reg=model.J_l1_reg,
@@ -987,6 +989,7 @@ class KernelBMF(BMF):
     dim_hid: int
     sparse_reg: float = 0
     tree_reg: float = 1e-2
+    tree_batch: int = 20          # rows per StS refresh in the tree penalty; 0 = exact
     uniform_scale: bool = True
     l1_reg: float = 0.0             # only used by the non-uniform scale M-step
     kernel_input: bool = False
@@ -1079,7 +1082,8 @@ class KernelBMF(BMF):
         out = np.zeros(S.shape) if self.debug else self._dummy_out
         self._search(data, S, lp.StS, StX, self.n, self.scl, float(self.sigma2),
                      float(self.temp), float(lp.sparse_reg), float(lp.tree_reg),
-                     Jc, hc, out, inplace, float(np.asarray(lp.temp)))
+                     Jc, hc, out, inplace, float(np.asarray(lp.temp)),
+                     int(lp.tree_batch or 0))
         if self.debug and inplace:
             self.outs.append(out)
         return S

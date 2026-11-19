@@ -12,20 +12,21 @@ the configuration is known (a closure factory closing over the link), instead
 of passing the link as a runtime argument (which would be an indirect,
 un-inlinable call in the n*m*m hot loop).
 
-A "link" is two element-wise pieces:
-    score(E, wjj, tau, sigma2)            -> (logodds, mu, nu)   [no RNG]
-    aux_update(Z, Seff, i, j, s, mu, nu)  -> None                [RNG + stores]
-`score` runs before the Bernoulli flip; `aux_update` runs after (and is the
-only place the slab draws its continuous Z), so the RNG-draw order matches the
-originals exactly.
-
+A "link" is two element-wise pieces, both on scalars:
+    score(E, wjj, tau, sigma2)  -> (logodds, mu, nu)   [no RNG]
+    aux_value(s, mu, nu)        -> z                   [RNG for the slab]
+`score` runs before the Bernoulli flip; `aux_value` after it (the only place the
+slab draws its continuous magnitude), and the scaffold stores z in Z, so the
+RNG-draw order matches the originals exactly.
 Two latent arrays, not three: `S` is the binary spike (drives the tree/StS
 combinatorics) and `Z` is the *effective continuous latent* read by the field
 accumulation.  The slab keeps the invariant Z==0 wherever the spike is off, so Z
-already equals S*magnitude -- the original snmf's `if S[i,k]>0` gate is redundant
-(a - 0.0 == a).  A no-slab model just initializes Z = S (the effective latent is
-the spike) and aux_update keeps Z == S.
-
+already equals S*magnitude.  A no-slab model just initializes Z = S and the
+binary link keeps Z == S.
+Plugins take and return scalars only: a call that passes arrays costs reference-
+count updates every time, which in the hot loop is several times the work of the
+arithmetic.  For the same reason the sparse bookkeeping below is written out in
+the sweeps rather than called.
 The scaffold owns everything shared: the permuted i,j loop, the neighbour-field
 accumulation from the gram (off Z), the tree/sparsity A/B/C/D regularizer, the
 StS bookkeeping (off S), and the sigmoid flip.
@@ -67,8 +68,8 @@ def score_binary(E, wjj, tau, sigma2):
 
 
 @njit(inline='always')
-def aux_binary(Z, i, j, s, mu, nu):
-    Z[i, j] = s                             # effective latent == the spike
+def aux_binary(s, mu, nu):
+    return s                                # effective latent == the spike
 
 
 # Spike-and-slab (recovers old_bae_search.snmf): the field is the partially
@@ -100,230 +101,298 @@ def score_slab(E, wjj, tau, sigma2):
 
 
 @njit(inline='always')
-def aux_slab(Z, i, j, s, mu, nu):
+def aux_slab(s, mu, nu):
     if s > 0.5:
-        Z[i, j] = numba_util.sample_trunc_norm(mu, nu)
-    else:
-        Z[i, j] = 0.0                       # maintains Z==0 off-spike
+        return numba_util.sample_trunc_norm(mu, nu)
+    return 0.0                              # maintains Z==0 off-spike
 
 
 # ---------------------------------------------------------------------------
-#  Prior plugins  (the latent prior's additive contribution to the log-odds)
+#  Prior terms  (the latent prior's additive contribution to the log-odds)
 # ---------------------------------------------------------------------------
 #
 # The conditional log-odds for the spike S_ij factors as
-#     score(E, wjj)                          # LIKELIHOOD, integrates the slab Z
-#   + [ -alpha - beta*inhib(S,StS) + sum_k A_jk S_ik + c_j ]   # PRIOR on S
-# The bracket is purely additive and *linear in the binary spikes S_ik*, so it is
-# its own plugin -- contributed by the LatentPrior, mirroring how the slab link is
-# contributed by the slab.  It bundles every prior term: sparsity (-alpha), the
-# tree/StS combinatorial reg (-beta*inhib), and -- for a Boltzmann prior -- the
-# Ising conditional (the coupling Jc, field hc).  Crucially it reads the binary
-# spike S_ik (NOT the magnitude Z_ik) and never touches wjj: folding the coupling
-# into WtW (`WtW+J`) only reproduces this in the binary kernel, where score is
-# affine and Z==S; for the slab it couples to the magnitude and corrupts the Z
-# posterior.  Same signature for every plugin (the unstructured one ignores Jc/hc,
-# which the model passes as zeros), so the factory can inject either.
+#     score(E, wjj)                                  # LIKELIHOOD, integrates the slab Z
+#   + [ -alpha - beta*inhib(S, StS) + coupling ]     # PRIOR on S
+# The bracket reads the binary spikes S_ik (never the magnitude Z_ik) and never
+# touches wjj.  The scaffold owns the two terms every prior shares -- sparsity
+# (-alpha) and the tree/StS penalty (-beta*inhib) -- and the prior PLUGIN supplies
+# only its coupling, as a pair of scalar functions (field, pair): the scaffold
+# computes  (field(hc_j) + sum_{k active, k != j} pair(Jc_jk)) / prior_temp,
+# summing over the row's ACTIVE latents (the Ising conditional is linear in S_ik,
+# so the inactive ones contribute nothing).  A prior with no coupling is None,
+# and the scaffold compiles the coupling out entirely.
+#
+# Tree penalty, two ways (chosen at run time by `tree_batch`):
+#   tree_batch == 0  exact: `_tree_inhib`, a dense O(m) pass over the live StS.
+#   tree_batch  > 0  batched: StS is read only at the start of each batch of
+#                    `tree_batch` rows (it is still updated live).  With StS fixed,
+#                    each k's contribution depends on the row only through
+#                    (S_ij, S_ik), so for s = S_ij
+#                        inhib = base[s, j] + sum_{k active} D[s, j, k]
+#                    with base[s, j] = sum_k f(j, k | s, 0) and
+#                    D[s, j, k] = f(j, k | s, 1) - f(j, k | s, 0) (zero for k == j).
+#                    O(m^2) per batch, then O(nnz) per site.  Exact for the frozen
+#                    StS; batches much larger than ~50 rows can destabilise the
+#                    sampler (stale counts switch many latents at once).
+
+@njit(inline='always')
+def _tree_contrib(StS, N, j, k, Sij, Sik):
+    # the A/B/C/D StS combinatorics for one (j, k), verbatim from old_bae_search.snmf
+    A = StS[j, k] - Sij * Sik
+    B = StS[j, j] - A - Sij
+    C = StS[k, k] - A
+    D = N - A - B - C
+    out = 0.0
+    if A < min(B, C - 1, D):
+        out += Sik
+    if B < min(A, C, D - 1):
+        out += 1 - Sik
+    if C <= min(A, B, D):
+        out -= Sik
+    if D <= min(A, B, C):
+        out -= 1 - Sik
+    return out
+
 
 @njit(inline='always')
 def _tree_inhib(S, i, j, StS, N, beta):
-    # the A/B/C/D StS combinatorics, summed over ALL k (incl. k==j), verbatim from
-    # old_bae_search.snmf -- so the unstructured prior reproduces the old scaffold bit
-    # for bit.  Gated on beta so a no-tree model pays nothing.
+    """Exact tree penalty: sum over ALL k (incl. k == j) against the live StS.
+    Gated on beta so a no-tree model pays nothing."""
     if not (beta > 1e-6):
         return 0.0
-    m = S.shape[1]
     Sij = S[i, j]
     inhib = 0.0
-    for k in range(m):
-        Sik = S[i, k]
-        A = StS[j, k] - Sij * Sik
-        B = StS[j, j] - A - Sij
-        C = StS[k, k] - A
-        D = N - A - B - C
-        if A < min(B, C - 1, D):
-            inhib += Sik
-        if B < min(A, C, D - 1):
-            inhib += 1 - Sik
-        if C <= min(A, B, D):
-            inhib -= Sik
-        if D <= min(A, B, C):
-            inhib -= 1 - Sik
+    for k in range(S.shape[1]):
+        inhib += _tree_contrib(StS, N, j, k, Sij, S[i, k])
     return inhib
 
 
-@njit(inline='always')
-def prior_unstructured(S, i, j, StS, N, Jc, hc, alpha, beta, prior_temp):
-    """LatentPrior: sparsity + tree/StS reg.  No coupling (Jc, hc, prior_temp
-    unused -- an unstructured prior has no temperature-scaled term)."""
-    return -alpha - beta * _tree_inhib(S, i, j, StS, N, beta)
+@njit
+def _tree_tables(StS, N, base, D):
+    """Fill base (2, m) and D (2, m, m) from the current StS (see above)."""
+    m = StS.shape[0]
+    for s in range(2):
+        for j in range(m):
+            b = 0.0
+            for k in range(m):
+                sk = s if k == j else 0          # k == j: S_ik is S_ij itself
+                f0 = _tree_contrib(StS, N, j, k, s, sk)
+                b += f0
+                D[s, j, k] = 0.0 if k == j else _tree_contrib(StS, N, j, k, s, 1) - f0
+            base[s, j] = b
 
 
 @njit(inline='always')
-def prior_boltzmann(S, i, j, StS, N, Jc, hc, alpha, beta, prior_temp):
-    """BoltzmannPrior: sparsity + tree + the Ising conditional, additive and linear
-    in the binary spikes S_ik.  Jc is the symmetric {0,1}-coupling (zero diagonal)
-    and hc the {0,1}-field, i.e. (2J, 2h) for a prior log p(S) ~ S'JS + 2h'S, so
-    this accumulates exactly its conditional log-odds 2*(J S + h)_j.  Both are
-    sigma2-independent: J is learned from the spike statistics alone, so the E-step
-    applies it at face value.
+def _ising_field(h):
+    return h
 
-    `prior_temp` is the prior temperature: the coupling contribution is divided by
-    it, so high prior_temp = weak structure.  This is the ONLY place it acts, so it
-    tempers how strongly the structure biases the sampling of S without touching
-    what the structure learns, and the fit loop can anneal it freely (see
-    bae_priors.TempSchedule).  The sparsity/tree terms are NOT scaled (they are
-    separate regularizers, not part of the temperature-controlled Boltzmann prior)."""
-    lp = -alpha - beta * _tree_inhib(S, i, j, StS, N, beta)
-    m = S.shape[1]
-    coup = hc[j]
-    for k in range(m):
-        if k != j:
-            coup += Jc[j, k] * S[i, k]
-    return lp + coup / prior_temp
+
+@njit(inline='always')
+def _ising_pair(J):
+    return J
+
+
+@njit(inline='always')
+def _zero(x):
+    return 0.0
+
+
+# LatentPrior: no coupling (sparsity and tree live in the scaffold).
+prior_unstructured = None
+# BoltzmannPrior: the Ising conditional.  Jc is the symmetric {0,1}-coupling (zero
+# diagonal) and hc the {0,1}-field, i.e. (2J, 2h) for a prior
+# log p(S) ~ S'JS + 2h'S, so the scaffold accumulates its conditional log-odds
+# 2*(J S + h)_j over the active latents.  sigma2-independent: J is learned from the
+# spike statistics alone.  `prior_temp` divides the coupling only (high prior_temp
+# = weak structure); the sparsity/tree terms are not scaled.
+prior_boltzmann = (_ising_field, _ising_pair)
+
+
+# ---------------------------------------------------------------------------
+#  Active sets  (the sparse row representation the sweeps share)
+# ---------------------------------------------------------------------------
+#
+# Row i's on-latents are act[i, :size[i]], unordered; pos[i, j] is j's slot in
+# act[i] or -1.  Add and remove are O(1) (remove swaps the last entry into the
+# hole), so every neighbour sum -- likelihood field, coupling, batched tree term,
+# StS update -- costs O(nnz) instead of O(m).  Rebuilt from S at each call.
+
+@njit
+def _active_sets(S):
+    n, m = S.shape
+    act = np.zeros((n, m), np.int64)
+    pos = -np.ones((n, m), np.int64)
+    size = np.zeros(n, np.int64)
+    for i in range(n):
+        for j in range(m):
+            if S[i, j] > 0.5:
+                act[i, size[i]] = j
+                pos[i, j] = size[i]
+                size[i] += 1
+    return act, pos, size
+
+
+# Add and remove are written out inside the sweeps rather than called as helpers:
+# a call that takes arrays (inline='always' or not) costs reference-count updates
+# on every call, which made the sweep ~2.3x slower at 64 latents.
 
 
 # ---------------------------------------------------------------------------
 #  The scaffold factory
 # ---------------------------------------------------------------------------
 #
-# Closes over (score, aux_update, prior) so they are compile-time freevar
+# Closes over (score, aux_value, prior) so they are compile-time freevar
 # constants -> inlinable.  Memoized so each distinct (link, prior) compiles the
-# kernel exactly once (the "construct the search when the class is created" step).
-# The scaffold owns only what is genuinely shared: the permuted i,j loop, the
-# LIKELIHOOD field (off Z, true gram), the Bernoulli flip, and the StS
-# bookkeeping.  The likelihood is `score`, the magnitude draw `aux_update`, and
-# the whole additive S-prior `prior` -- the prior runs its own k-loop, which
-# numba inlines into the sweep (no call overhead, no second pass kept around).
+# kernel exactly once.  The scaffold owns what is shared: the permuted i, j loop,
+# the active sets, the LIKELIHOOD field (off Z, true gram), sparsity and tree
+# penalties, the Bernoulli flip, and the StS bookkeeping.
 
 @lru_cache(maxsize=None)
-def _make_dense_sweep(score, aux_update, prior, diag_gram=False, debug=False):
-    """ONE chain's 2-D coordinate-descent sweep -- the shared body both the serial
-    and the parallel dense search run.  Operates on 2-D state (S/Z/WtW/StS/XW),
-    scalar sigma2, and a 2-D-or-None `out`; the serial search calls it directly and
-    the parallel one calls it per chain inside `prange(C)`, so the sweep logic lives
-    in exactly one place.
-
-    `score`, `aux_update`, `prior`, `diag_gram`, `debug` are compile-time freevar
-    constants: the link plugins (marked inline='always') fold into the loop, and the
-    diag_gram / debug branches are pruned by LLVM (no runtime cost).
-
-    * `diag_gram` -- set when the operator's gram is diagonal (orthonormal W,
-      WtW == I, e.g. BiPCA): then sum_k WtW[j,k] Z[i,k] is exactly XW[i,j], so the
-      O(m) neighbour loop is pure waste and is eliminated entirely.
-    * `debug` -- samples EXACTLY as normal but also records each element's log-odds
-      (logodds + prior, pre-temp) into `out` as it sweeps, so you can watch the
-      current magnitudes over a real fit.  Off (the normal path) never touches `out`.
-    Memoized, so the serial and parallel builds of the same (link, prior, diag_gram,
-    debug) share one compiled sweep."""
+def _make_dense_sweep(score, aux_value, prior, diag_gram=False, debug=False,
+                      batched_tree=False):
+    """ONE chain's sweep over 2-D state (S/Z (n,m), WtW/StS (m,m), XW (n,m)), scalar
+    sigma2 and prior_temp; the serial search calls it directly and the parallel one
+    per chain inside `prange(C)`.
+    * `diag_gram` -- the gram is diagonal (orthonormal W, e.g. BiPCA), so the
+      neighbour sum vanishes and is skipped.
+    * `debug` -- samples exactly as normal but records each element's pre-temp
+      log-odds (likelihood + prior) into `out`.
+    * `batched_tree` -- compile-time choice of the tree penalty: the exact dense
+      pass, or the batched tables refreshed every `tree_batch` rows (see "Prior
+      terms").  Compiled separately because inlining the unused exact pass into the
+      batched loop slowed it ~1.7x.  The search wrapper picks one per call.
+    Visits rows and latents in random order and draws one uniform per site (plus
+    the slab magnitude when on), the same RNG stream as before the sparse rewrite;
+    the neighbour sums now run over active latents only, so results can differ from
+    the dense kernel in the last floating-point bit."""
+    coupled = prior is not None
+    field, pair = prior if coupled else (_zero, _zero)
 
     @njit
     def sweep(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-              Jc, hc, inplace, out, prior_temp):
+              Jc, hc, inplace, out, prior_temp, tree_batch):
         n, m = S.shape
         regularize = beta > 1e-6
-
-        for i in np.random.permutation(np.arange(n)):
+        act, pos, size = _active_sets(S)
+        base = np.zeros((2, m))
+        D = np.zeros((2, m, m)) if batched_tree else np.zeros((2, 1, 1))
+        rows = np.random.permutation(np.arange(n))
+        for r in range(n):
+            i = rows[r]
+            if batched_tree and regularize and r % tree_batch == 0:
+                _tree_tables(StS, N, base, D)
             for j in np.random.permutation(np.arange(m)):
-
                 Sij = S[i, j]
-
-                # LIKELIHOOD field: off Z, true gram only (no prior leakage).
-                # With a diagonal gram the neighbour sum vanishes -> skip the loop.
+                s = 1 if Sij > 0.5 else 0
+                p = pos[i, j]                    # remove j from the active set
+                if p >= 0:
+                    last = act[i, size[i] - 1]
+                    act[i, p] = last
+                    pos[i, last] = p
+                    pos[i, j] = -1
+                    size[i] -= 1
+                # ONE pass over the other active latents gathers every neighbour sum:
+                # the LIKELIHOOD field (off Z, true gram; Z == 0 wherever the spike is
+                # off, so this is exact for the slab), the prior coupling, and the
+                # batched tree correction (D[s, j, j] == 0, so excluding j is exact).
                 E = XW[i, j]
-                if not diag_gram:
-                    for k in range(m):
-                        if k != j:
-                            E -= WtW[j, k] * Z[i, k]
-
+                coup = field(hc[j]) if coupled else 0.0
+                inhib = base[s, j] if (batched_tree and regularize) else 0.0
+                for l in range(size[i]):
+                    k = act[i, l]
+                    if not diag_gram:
+                        E -= WtW[j, k] * Z[i, k]
+                    if coupled:
+                        coup += pair(Jc[j, k])
+                    if batched_tree and regularize:
+                        inhib += D[s, j, k]
+                if regularize and not batched_tree:
+                    inhib = _tree_inhib(S, i, j, StS, N, beta)   # exact: dense, live StS
+                # PRIOR on S: sparsity, coupling, tree
+                lp = -alpha - beta * inhib if regularize else -alpha
+                if coupled:
+                    lp += coup / prior_temp
                 logodds, mu, nu = score(E, WtW[j, j], tau, sigma2)
-
-                # PRIOR on S: additive, owned by the latent prior (sparsity +
-                # tree + any coupling), linear in the binary spikes.  prior_temp
-                # scales the structured (coupling) part only.
-                lp = prior(S, i, j, StS, N, Jc, hc, alpha, beta, prior_temp)
-
                 if debug:
                     out[i, j] = logodds + lp     # record, then sample as usual
-
                 curr = (logodds + lp) / temp
-
                 if curr < -100:
                     prob = 0.0
                 elif curr > 100:
                     prob = 1.0
                 else:
                     prob = 1.0 / (1.0 + math.exp(-curr))
-
                 new_Sij = 1.0 * (np.random.rand() < prob)
+                if new_Sij > 0.5:                # add j to the active set
+                    act[i, size[i]] = j
+                    pos[i, j] = size[i]
+                    size[i] += 1
                 ds = new_Sij - Sij
-
                 # StS bookkeeping (the prior's state; maintained by the scaffold)
-                if regularize and inplace:
+                if regularize and inplace and ds != 0.0:
                     StS[j, j] += ds
-                    for k in range(m):
+                    for l in range(size[i]):
+                        k = act[i, l]
                         if k != j:
-                            StS[j, k] += S[i, k] * ds
-                            StS[k, j] += S[i, k] * ds
-
+                            StS[j, k] += ds
+                            StS[k, j] += ds
                 S[i, j] = new_Sij
-                aux_update(Z, i, j, new_Sij, mu, nu)
-
+                Z[i, j] = aux_value(new_Sij, mu, nu)
         return S, Z
-
     return sweep
 
 
-def _build_dense_search(score, aux_update, prior, diag_gram=False, debug=False,
+def _build_dense_search(score, aux_value, prior, diag_gram=False, debug=False,
                         parallel=False):
-    """The dense E-step kernel, in one factory.  `parallel` (a compile-time flag)
-    selects between two thin wrappers around the shared `_make_dense_sweep` body:
+    """The dense E-step kernel, in one factory.  `parallel` (compile time) selects
+    between two thin wrappers around the shared `_make_dense_sweep` body:
+      parallel=False -- a plain @njit over 2-D state; the single-chain path, with the
+                        serial RNG stream.
+      parallel=True  -- an @njit(parallel=True) running the SAME sweep per chain in
+                        `prange(C)` over 3-D state (leading chain axis; sigma2 and
+                        prior_temp (C,)).  Chains own all their state, so this is
+                        race-free.
+    Two wrappers because numba types a function on its argument shapes (a 2-D and a
+    3-D `S` cannot share one compiled body).  Memoized via make_dense_search on
+    (link, prior, diag_gram, debug, parallel).  The operator (bae_weights) passes
+    parallel=(n_chains > 1)."""
+    sweep_exact = _make_dense_sweep(score, aux_value, prior, diag_gram, debug, False)
+    sweep_batch = _make_dense_sweep(score, aux_value, prior, diag_gram, debug, True)
 
-      parallel=False -- a plain @njit over 2-D state (S/Z/... shaped (n,m)/(m,m),
-                        sigma2 a scalar).  This is the single-chain path; it keeps
-                        the exact serial RNG stream, so it stays bit-for-bit equal
-                        to old_bae_search.sbmf / snmf.
-      parallel=True  -- an @njit(parallel=True) that runs the SAME sweep per chain
-                        inside `prange(C)` over 3-D state (leading chain axis C,
-                        sigma2 (C,)).  Chains are embarrassingly parallel (each owns
-                        its own S/Z/StS/W), so the prange is race-free without locks.
-
-    Two wrappers rather than one because numba types a function on its argument
-    shapes: a 2-D and a 3-D `S` cannot share one compiled body, and routing a single
-    chain through `prange` would change its RNG stream (per-thread RNG).  The sweep
-    LOGIC is shared, though -- only the outer iteration (nothing vs prange over
-    chains) and the per-chain indexing differ.  Memoized on
-    (link, prior, diag_gram, debug, parallel) via make_dense_search, so each variant
-    compiles once.  The operator (bae_weights) passes parallel=(n_chains > 1)."""
-
-    sweep = _make_dense_sweep(score, aux_update, prior, diag_gram, debug)
+    @njit
+    def sweep(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
+              Jc, hc, inplace, out, prior_temp, tree_batch):
+        if tree_batch > 0 and beta > 1e-6:
+            return sweep_batch(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
+                               Jc, hc, inplace, out, prior_temp, tree_batch)
+        return sweep_exact(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
+                           Jc, hc, inplace, out, prior_temp, tree_batch)
 
     if parallel:
         @njit(parallel=True)
         def search(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-                   Jc, hc, inplace=True, out=None, prior_temp=None):
+                   Jc, hc, inplace=True, out=None, prior_temp=None, tree_batch=0):
             C = S.shape[0]
             for c in prange(C):
-                # `prior_temp` is per chain here ((C,), like sigma2) -- the prior
-                # temperature may differ across chains (e.g. AdaptiveTemp with a
-                # per-chain loss), so each chain divides its coupling by its own.
-                # `out` is (C,n,m) under debug (else None); the if/else is pruned
-                # since `debug` is a compile-time constant, so None is never indexed.
+                # `out` is (C,n,m) under debug (else None); the branch is pruned
+                # since `debug` is a compile-time constant.
                 if debug:
                     sweep(XW[c], S[c], Z[c], WtW[c], StS[c], N, temp, alpha, beta,
-                          tau, sigma2[c], Jc[c], hc[c], inplace, out[c], prior_temp[c])
+                          tau, sigma2[c], Jc[c], hc[c], inplace, out[c], prior_temp[c],
+                          tree_batch)
                 else:
                     sweep(XW[c], S[c], Z[c], WtW[c], StS[c], N, temp, alpha, beta,
-                          tau, sigma2[c], Jc[c], hc[c], inplace, out, prior_temp[c])
+                          tau, sigma2[c], Jc[c], hc[c], inplace, out, prior_temp[c],
+                          tree_batch)
             return S, Z
     else:
         @njit
         def search(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-                   Jc, hc, inplace=True, out=None, prior_temp=1.0):
+                   Jc, hc, inplace=True, out=None, prior_temp=1.0, tree_batch=0):
             sweep(XW, S, Z, WtW, StS, N, temp, alpha, beta, tau, sigma2,
-                  Jc, hc, inplace, out, prior_temp)
+                  Jc, hc, inplace, out, prior_temp, tree_batch)
             return S, Z
-
     search._dense_sweep = sweep    # exposed for the inlining self-test
     return search
 
@@ -355,6 +424,9 @@ make_dense_search = lru_cache(maxsize=None)(_build_dense_search)
 # compute the identical field when K = X X^T.
 
 def _build_kernel_search(prior, kernel_input=False, currents=False, debug=False):
+    coupled = prior is not None
+    field, pair = prior if coupled else (_zero, _zero)
+
     # `currents` (compile-time) turns the kernel into a diagnostic: instead of
     # sampling, it writes the raw per-element log-odds (like + prior, pre-temp)
     # into `out` and does NOT flip -- so every (i,j) is scored against the SAME
@@ -369,20 +441,26 @@ def _build_kernel_search(prior, kernel_input=False, currents=False, debug=False)
 
     @njit
     def search(data, S, StS, StX, N, scl, sigma2, temp, alpha, beta, Jc, hc, out,
-               inplace=True, prior_temp=1.0):
+               inplace=True, prior_temp=1.0, tree_batch=0):
         n, m = S.shape
         t = (N - 1) / N
-
-        for i in np.random.permutation(np.arange(n)):
+        regularize = beta > 1e-6
+        batched = regularize and tree_batch > 0
+        act, pos, size = _active_sets(S)
+        base = np.zeros((2, m))
+        D = np.zeros((2, m, m)) if batched else np.zeros((2, 1, 1))
+        rows = np.random.permutation(np.arange(n))
+        for r in range(n):
+            i = rows[r]
+            if batched and r % tree_batch == 0:
+                _tree_tables(StS, N, base, D)
             for j in np.random.permutation(np.arange(m)):
-
                 Sij = S[i, j]
+                s = 1 if Sij > 0.5 else 0
                 S_j = (StS[j, j] - Sij) / (N - 1)
                 pij = scl[j]
-
-                # LIKELIHOOD field: response of <data, S diag(scl) S^T> to a flip.
-                # feature form uses the live StX = S^T X; kernel form reads K
-                # directly.  Identical value when K == X X^T.
+                # LIKELIHOOD (kernel-specific and dense: every latent enters through
+                # its centred value S_ik - S_k, and the data term is O(n) or O(d))
                 if kernel_input:
                     inp = (1 - 2 * Sij) * data[i, i] / t
                     for k in range(n):
@@ -393,9 +471,6 @@ def _build_kernel_search(prior, kernel_input=False, currents=False, debug=False)
                     for k in range(d):
                         inp += (2 * StX[j, k] * data[i, k]
                                 + (1 - 2 * Sij) * data[i, k] ** 2) / t
-
-                # normalizer recurrence off StS (the ||center(S diag(scl) S^T)||^2
-                # term), each neighbour weighted by its scale scl[k] -- kerbmf3.
                 dot = pij * (t * (2 * (N - 2) * S_j * (1 - S_j) + 1) * (0.5 - Sij))
                 for k in range(m):
                     Sik = S[i, k]
@@ -404,48 +479,56 @@ def _build_kernel_search(prior, kernel_input=False, currents=False, debug=False)
                                 + t * (0.5 - S_j - S_k - (N - 2) * S_j * S_k)) * (Sik - S_k)
                     term -= t * (1 - S_k) * S_k * (2 * S_j - 1)
                     dot += scl[k] * term
-
-                # Divide the LIKELIHOOD field by the entry-noise variance sigma2
-                # (the Gaussian precision, exactly like the dense scaffold's
-                # (E - 0.5 wjj)/sigma2), NOT by a fixed N.  The raw field
-                # pij*(inp - dot) has magnitude ~ <K^2> (the mean squared kernel
-                # entry) independent of N, so with sigma2 = <K^2> = data_norm/N^2
-                # the log-odds is O(1) in N, d and the input scale -- which keeps
-                # the sigmoid out of both the saturated and the coin-flip regimes.
-                # (The old /(N-1) fixed sigma2 = N-1, an input-scale-blind noise
-                # level that made the log-odds ~ <K^2>/N: tiny for O(1)-entry
-                # kernels, huge for raw Grams.)
                 like = pij * (inp - dot) / sigma2
-
-                # additive S-prior (sparsity + tree + coupling): the SHARED plugin
-                # (prior_temp scales the structured coupling part only)
-                lp = prior(S, i, j, StS, N, Jc, hc, alpha, beta, prior_temp)
-
+                # PRIOR: the same terms and plugins as the dense scaffold
+                lp = -alpha
+                if coupled:
+                    coup = field(hc[j])
+                    for l in range(size[i]):
+                        k = act[i, l]
+                        if k != j:
+                            coup += pair(Jc[j, k])
+                    lp += coup / prior_temp
+                if regularize:
+                    if batched:
+                        inhib = base[s, j]
+                        for l in range(size[i]):
+                            inhib += D[s, j, act[i, l]]      # D[s, j, j] == 0
+                    else:
+                        inhib = _tree_inhib(S, i, j, StS, N, beta)
+                    lp -= beta * inhib
                 if currents:
                     out[i, j] = like + lp        # diagnostic: score, do not flip
                     continue
-
                 if debug:
                     out[i, j] = like + lp        # record, then sample as usual
-
                 curr = (like + lp) / temp
-
                 if curr < -100:
                     prob = 0.0
                 elif curr > 100:
                     prob = 1.0
                 else:
                     prob = 1.0 / (1.0 + math.exp(-curr))
-
                 ds = (1.0 * (np.random.rand() < prob)) - Sij
                 S[i, j] += ds
-
-                if inplace:
+                if ds > 0:                       # add j to the active set
+                    act[i, size[i]] = j
+                    pos[i, j] = size[i]
+                    size[i] += 1
+                elif ds < 0:                     # remove j
+                    p = pos[i, j]
+                    last = act[i, size[i] - 1]
+                    act[i, p] = last
+                    pos[i, last] = p
+                    pos[i, j] = -1
+                    size[i] -= 1
+                if inplace and ds != 0.0:
                     StS[j, j] += ds
-                    for k in range(m):
+                    for l in range(size[i]):
+                        k = act[i, l]
                         if k != j:
-                            StS[j, k] += S[i, k] * ds
-                            StS[k, j] += S[i, k] * ds
+                            StS[j, k] += ds
+                            StS[k, j] += ds
                     if not kernel_input:
                         d = StX.shape[1]
                         for k in range(d):
@@ -458,7 +541,7 @@ def _build_kernel_search(prior, kernel_input=False, currents=False, debug=False)
 
 make_kernel_search = lru_cache(maxsize=None)(_build_kernel_search)
 
-# A model composes a "link" -- the (score, aux_update) pair from the slab side --
+# A model composes a "link" -- the (score, aux_value) pair from the slab side --
 # with a "prior" -- the additive S-prior from the LatentPrior.  no-slab models use
 # BINARY_LINK, slab models SLAB_LINK; unstructured priors use PRIOR_PLAIN,
 # Boltzmann-structured ones PRIOR_BOLTZMANN.
