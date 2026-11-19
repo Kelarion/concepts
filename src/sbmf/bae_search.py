@@ -132,16 +132,19 @@ def aux_slab(s, mu, nu):
 #                        inhib = base[s, j] + sum_{k active} D[s, j, k]
 #                    with base[s, j] = sum_k f(j, k | s, 0) and
 #                    D[s, j, k] = f(j, k | s, 1) - f(j, k | s, 0) (zero for k == j).
-#                    O(m^2) per batch, then O(nnz) per site.  Exact for the frozen
+#                    O(m^2) per batch, then O(nnz) per site.  (Evaluating D per
+#                    active pair instead, as the 0.0.14 Cython sampler did, was no
+#                    faster: the baseline is most of each rebuild.)  Exact for the frozen
 #                    StS; batches much larger than ~50 rows can destabilise the
 #                    sampler (stale counts switch many latents at once).
 
 @njit(inline='always')
-def _tree_contrib(StS, N, j, k, Sij, Sik):
-    # the A/B/C/D StS combinatorics for one (j, k), verbatim from old_bae_search.snmf
-    A = StS[j, k] - Sij * Sik
-    B = StS[j, j] - A - Sij
-    C = StS[k, k] - A
+def _tree_rule(Sjk, Sjj, Skk, N, Sij, Sik):
+    # the A/B/C/D StS combinatorics for one (j, k), verbatim from old_bae_search.snmf,
+    # on scalars (StS[j,k], StS[j,j], StS[k,k]) so calls in hot loops pass no arrays
+    A = Sjk - Sij * Sik
+    B = Sjj - A - Sij
+    C = Skk - A
     D = N - A - B - C
     out = 0.0
     if A < min(B, C - 1, D):
@@ -156,15 +159,21 @@ def _tree_contrib(StS, N, j, k, Sij, Sik):
 
 
 @njit(inline='always')
+def _tree_contrib(StS, N, j, k, Sij, Sik):
+    return _tree_rule(StS[j, k], StS[j, j], StS[k, k], N, Sij, Sik)
+
+
+@njit(inline='always')
 def _tree_inhib(S, i, j, StS, N, beta):
     """Exact tree penalty: sum over ALL k (incl. k == j) against the live StS.
     Gated on beta so a no-tree model pays nothing."""
     if not (beta > 1e-6):
         return 0.0
     Sij = S[i, j]
+    Sjj = StS[j, j]
     inhib = 0.0
     for k in range(S.shape[1]):
-        inhib += _tree_contrib(StS, N, j, k, Sij, S[i, k])
+        inhib += _tree_rule(StS[j, k], Sjj, StS[k, k], N, Sij, S[i, k])
     return inhib
 
 
@@ -172,14 +181,19 @@ def _tree_inhib(S, i, j, StS, N, beta):
 def _tree_tables(StS, N, base, D):
     """Fill base (2, m) and D (2, m, m) from the current StS (see above)."""
     m = StS.shape[0]
-    for s in range(2):
-        for j in range(m):
+    for j in range(m):
+        Sjj = StS[j, j]
+        for s in range(2):
             b = 0.0
             for k in range(m):
-                sk = s if k == j else 0          # k == j: S_ik is S_ij itself
-                f0 = _tree_contrib(StS, N, j, k, s, sk)
-                b += f0
-                D[s, j, k] = 0.0 if k == j else _tree_contrib(StS, N, j, k, s, 1) - f0
+                Sjk, Skk = StS[j, k], StS[k, k]
+                if k == j:                       # S_ik is S_ij itself
+                    b += _tree_rule(Sjk, Sjj, Skk, N, s, s)
+                    D[s, j, k] = 0.0
+                else:
+                    f0 = _tree_rule(Sjk, Sjj, Skk, N, s, 0)
+                    b += f0
+                    D[s, j, k] = _tree_rule(Sjk, Sjj, Skk, N, s, 1) - f0
             base[s, j] = b
 
 
